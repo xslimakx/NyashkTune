@@ -1,0 +1,72 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux,   os: ubuntu-22.04 }
+          - { name: Windows, os: windows-latest }
+          - { name: macOS,   os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgl-dev libjack-jackd2-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-dri2-0-dev \
+            libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev
+
+      - name: Bundle VST3
+        run: cargo xtask bundle -p nyashktune --release
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/bundled
+          zip -r -y "../../NyashkTune-${{ matrix.name }}-VST3.zip" NyashkTune.vst3
+          
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/bundled/NyashkTune.vst3 -DestinationPath NyashkTune-Windows-VST3.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nyashk-${{ matrix.name }}-VST3
+          path: "*-${{ matrix.name }}-VST3.zip"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "*-VST3.zip"
+          generate_release_notes: true
+          body_path: RELEASE_NOTES.md

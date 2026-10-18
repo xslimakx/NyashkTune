@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["plugins/nyashktune", "xtask"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+
+[patch."https://github.com/RustAudio/baseview.git"]
+baseview = { path = "vendor/baseview" }
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+codegen-units = 1
+debug = false
+strip = "symbols"

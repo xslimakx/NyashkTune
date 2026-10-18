@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+__pycache__/
+*.pyc
+*.f32
+*.npy
+*.wav
+.DS_Store
+.idea/
+.vscode/
