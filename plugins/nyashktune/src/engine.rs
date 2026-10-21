@@ -129,6 +129,9 @@ pub struct Params {
     pub fine_cents: f32,
     pub formant_semis: f32,
     pub formant_preserve: bool,
+    pub formant_on: bool,    // off: formants are never touched (and no FFT is run)
+    pub voices_on: bool,     // master switch of the extra voices (off: nothing is computed for them)
+    pub colour_on: bool,     // off: Air / Drive are skipped
     pub formant_mode: FormantMode,
     pub formant_tilt: f32,   // -1..1, formant shift applied more to highs (+) or lows (-)
     pub formant_follow: f32, // 0..1, how much the formants follow the pitch correction when not preserved
@@ -169,6 +172,9 @@ impl Default for Params {
             fine_cents: 0.0,
             formant_semis: 0.0,
             formant_preserve: true,
+            formant_on: true,
+            voices_on: true,
+            colour_on: true,
             formant_mode: FormantMode::Classic,
             formant_tilt: 0.0,
             formant_follow: 1.0,
@@ -544,7 +550,7 @@ impl Engine {
         }
         if self.started {
             for v in 1..=NUM_VOICES {
-                if self.p.voices[v - 1].on && !self.p.bypass {
+                if self.p.voices_on && self.p.voices[v - 1].on && !self.p.bypass {
                     if !self.vact[v] {
                         // join in step with the lead
                         self.syn[v] = self.syn[0];
@@ -562,8 +568,8 @@ impl Engine {
         // output
         let mut out = [0.0f32; MAX_CH];
         let oi = (o & self.ring_mask) as usize;
-        let drive = self.p.drive.clamp(0.0, 1.0);
-        let air_on = self.p.air_db.abs() > 0.05;
+        let drive = if self.p.colour_on { self.p.drive.clamp(0.0, 1.0) } else { 0.0 };
+        let air_on = self.p.colour_on && self.p.air_db.abs() > 0.05;
         for c in 0..nch {
             let mut wet = self.ola[c][oi];
             self.ola[c][oi] = 0.0;
@@ -1041,7 +1047,7 @@ impl Engine {
         let hs = p / r;
         let hg = (p.max(hs).ceil() as i64).max(8);
         let follow = if self.p.formant_preserve { 0.0 } else { self.p.formant_follow as f64 };
-        let s_raw = 2f64.powf((self.p.formant_semis + vformant) as f64 / 12.0) * r.powf(follow);
+        let s_raw = if self.p.formant_on { 2f64.powf((self.p.formant_semis + vformant) as f64 / 12.0) * r.powf(follow) } else { 1.0 };
         let mode = self.p.formant_mode;
         let spectral = mode != FormantMode::Classic && s_raw.ln().abs() > 0.002 && (2 * hg) as usize <= self.gbuf[0].len();
         let s_cl = if mode == FormantMode::Classic { s_raw.clamp(0.5, 2.0) } else { 1.0 };
@@ -1256,6 +1262,48 @@ mod fuzz_tests {
                 assert!(peak < 8.0 * inpk.max(0.1), "peak {peak} input peak {inpk} (fs {fs}, nch {nch})");
             }
         }
+    }
+
+    /// Switching modules on and off while singing must not click.
+    #[test]
+    fn toggling_modules_does_not_click() {
+        let mut seed = 77u32;
+        let fs = 48000.0;
+        let x = voice_signal(fs, 8.0, &mut seed);
+        let run = |toggle: bool| -> f32 {
+            let mut e = Engine::new(fs, 70.0);
+            let mut p = Params::default();
+            p.scale = 0;
+            p.formant_semis = 4.0;
+            p.formant_mode = FormantMode::Detailed;
+            let mut maxj = 0.0f32;
+            let mut prev = 0.0f32;
+            for (bi, chunk) in x.chunks(240).enumerate() {
+                if toggle {
+                    let ph = bi / 100; // every 0.5 s
+                    p.formant_on = ph % 2 == 0;
+                    p.colour_on = ph % 3 != 0;
+                    p.air_db = 6.0;
+                    p.drive = 0.3;
+                    p.voices[0].on = ph % 2 == 1;
+                    p.voices[1].on = ph % 3 == 1;
+                    p.voices[0].interval = 7.0;
+                    p.voices_on = ph % 4 != 3;
+                }
+                e.set_params(&p);
+                for &s in chunk {
+                    let o = e.process_frame([s, s], 1)[0];
+                    if bi > 60 {
+                        maxj = maxj.max((o - prev).abs());
+                    }
+                    prev = o;
+                }
+            }
+            maxj
+        };
+        let base = run(false);
+        let tog = run(true);
+        assert!(tog < 3.0 * base + 0.05, "toggle jump {tog} vs plain {base}");
     }
 
     #[test]

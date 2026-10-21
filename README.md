@@ -38,7 +38,20 @@ Realtime vocal pitch correction, from transparent, natural-sounding tuning to th
 | **Voices** | 2 extra voices (harmony / octave / double): interval, scale-aware snapping, level, pan, detune, formant, delay |
 | **Colour** | Air (7 kHz shelf) and Drive (soft saturation) on the processed voice |
 | **Voice range** | Generic, Bass, Baritone, Tenor, Alto, Mezzo-Soprano, Soprano, Instrument |
+| **Your presets** | **SAVE PRESET** stores every setting under your own name (any language / symbols); they appear in the preset list after the factory ones, **DELETE** removes them. Files: `~/.config/NyashkTune/presets` (Linux), `%APPDATA%\\NyashkTune\\presets` (Windows), `~/Library/Application Support/NyashkTune/presets` (macOS) - copy them to share |
+| **Switch off what you don't need** | the module switches on the tab bar - **FORMANT**, **VOICES** (master) and each voice **ON**, **COLOUR** (Air/Drive), **VIBRATO**: when off the stage is skipped completely (no CPU) - plain pitch correction only needs the TUNE tab |
 | **Other** | 28 presets (incl. **Anime Vocal**), full automation, state recall, resizable window |
+
+### Scale Learn
+
+At the bottom of the TUNE tab. While you sing, the plugin counts how long each of the 12 notes was heard (the bars; white = a note you really use). 
+- **DETECT** compares the histogram with typical major / minor profiles and sets KEY + SCALE (shown as "sung in: A minor (87%)"; needs a couple of seconds of singing).
+- **LEARN** makes a **Custom** scale from exactly the notes you sang (notes below 12 % of the most used one are ignored).
+- **CLEAR** starts over. Counting uses the raw sung pitch, before correction.
+
+### Latency
+
+Latency comes only from the pitch detector (the Voice Range sets it), not from formant / voices / colour: switching those on or off does not change it.
 
 ### Formant algorithms
 
@@ -78,7 +91,7 @@ The *Anime* presets are a bright, small-vocal-tract starting point (formants up,
 
 The window is resizable: drag the grip in the bottom-right corner and the whole UI scales proportionally.
 
-### Latency
+### Latency (table)
 
 The plugin reports its latency to the host, so your DAW compensates for it automatically:
 

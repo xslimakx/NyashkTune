@@ -226,6 +226,12 @@ pub struct NyashkTuneParams {
     pub formant: FloatParam,
     #[id = "keepformants"]
     pub keep_formants: BoolParam,
+    #[id = "formanton"]
+    pub formant_on: BoolParam,
+    #[id = "voiceson"]
+    pub voices_on: BoolParam,
+    #[id = "colouron"]
+    pub colour_on: BoolParam,
     #[id = "fmode"]
     pub fmode: EnumParam<FormantAlgo>,
     #[id = "ftilt"]
@@ -319,6 +325,9 @@ impl Default for NyashkTuneParams {
             fine: FloatParam::new("Detune", 0.0, lin(-100.0, 100.0)).with_unit(" c").with_step_size(0.1),
             formant: FloatParam::new("Formant Shift", 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(0.1),
             keep_formants: BoolParam::new("Keep Formants", true),
+            formant_on: BoolParam::new("Formant On", true),
+            voices_on: BoolParam::new("Voices On", true),
+            colour_on: BoolParam::new("Colour On", true),
             fmode: EnumParam::new("Formant Algorithm", FormantAlgo::Classic),
             ftilt: FloatParam::new("Formant Tilt", 0.0, lin(-100.0, 100.0)).with_unit(" %").with_step_size(1.0),
             ffollow: FloatParam::new("Formant Follow", 100.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
@@ -393,6 +402,9 @@ impl NyashkTuneParams {
             fine_cents: self.fine.value(),
             formant_semis: self.formant.value(),
             formant_preserve: self.keep_formants.value(),
+            formant_on: self.formant_on.value(),
+            voices_on: self.voices_on.value(),
+            colour_on: self.colour_on.value(),
             formant_mode: formant::FormantMode::from_index(self.fmode.value() as usize),
             formant_tilt: self.ftilt.value() / 100.0,
             formant_follow: self.ffollow.value() / 100.0,

@@ -66,6 +66,9 @@ struct Gui {
     last_target: f32,
     voiced: bool,
     tab: usize,
+    user: Vec<String>,
+    user_sel: Option<String>,
+    save_name: Option<String>,
 }
 
 fn midi_name(m: i32) -> String {
@@ -140,6 +143,9 @@ fn apply_preset(setter: &ParamSetter, p: &NyashkTuneParams, idx: usize) {
     reset(setter, &p.fine);
     reset(setter, &p.formant);
     reset(setter, &p.keep_formants);
+    reset(setter, &p.formant_on);
+    reset(setter, &p.colour_on);
+    reset(setter, &p.voices_on);
     reset(setter, &p.fmode);
     reset(setter, &p.ftilt);
     reset(setter, &p.ffollow);
@@ -403,6 +409,135 @@ fn apply_preset(setter: &ParamSetter, p: &NyashkTuneParams, idx: usize) {
     p.preset.store(idx as u32, Ordering::Relaxed);
 }
 
+// ------------------------------------------------------------------------------------------
+// User presets: plain text files "id=value" in the user's config folder
+// ------------------------------------------------------------------------------------------
+
+fn preset_dir() -> Option<std::path::PathBuf> {
+    let base = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(std::path::PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+    }?;
+    Some(base.join("NyashkTune").join("presets"))
+}
+
+fn clean_preset_name(n: &str) -> String {
+    n.trim().chars().filter(|c| !c.is_control() && !"/\\:*?\"<>|".contains(*c)).collect::<String>().trim().to_string()
+}
+
+fn list_user_presets() -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if let Some(d) = preset_dir() {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("nytune") {
+                    if let Some(n) = path.file_stem().and_then(|x| x.to_str()) {
+                        v.push(n.to_string());
+                    }
+                }
+            }
+        }
+    }
+    v.sort_by_key(|a| a.to_lowercase());
+    v
+}
+
+fn save_user_preset(p: &NyashkTuneParams, name: &str) -> std::io::Result<String> {
+    let name = clean_preset_name(name);
+    if name.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty name"));
+    }
+    let dir = preset_dir().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no config folder"))?;
+    std::fs::create_dir_all(&dir)?;
+    let mut out = String::from("NyashkTune preset v1\n");
+    for (id, ptr, _) in p.param_map() {
+        if id == "bypass" {
+            continue;
+        }
+        // SAFETY: the pointer comes from our own live parameter struct
+        let v = unsafe { ptr.unmodulated_normalized_value() };
+        out.push_str(&format!("{id}={v:.7}\n"));
+    }
+    out.push_str(&format!("@note_bypass={}\n", p.note_bypass.load(Ordering::Relaxed)));
+    std::fs::write(dir.join(format!("{name}.nytune")), out)?;
+    Ok(name)
+}
+
+fn load_user_preset(setter: &ParamSetter, p: &NyashkTuneParams, name: &str) -> bool {
+    let Some(dir) = preset_dir() else { return false };
+    let Ok(text) = std::fs::read_to_string(dir.join(format!("{name}.nytune"))) else { return false };
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            map.insert(k.to_string(), v.trim().to_string());
+        }
+    }
+    if let Some(v) = map.get("@note_bypass").and_then(|v| v.parse::<u32>().ok()) {
+        p.note_bypass.store(v, Ordering::Relaxed);
+    }
+    for (id, ptr, _) in p.param_map() {
+        if id == "bypass" {
+            continue;
+        }
+        if let Some(v) = map.get(&id).and_then(|v| v.parse::<f32>().ok()) {
+            // SAFETY: the pointer comes from our own live parameter struct
+            unsafe {
+                setter.raw_context.raw_begin_set_parameter(ptr);
+                setter.raw_context.raw_set_parameter_normalized(ptr, v.clamp(0.0, 1.0));
+                setter.raw_context.raw_end_set_parameter(ptr);
+            }
+        }
+    }
+    true
+}
+
+fn delete_user_preset(name: &str) {
+    if let Some(dir) = preset_dir() {
+        let _ = std::fs::remove_file(dir.join(format!("{name}.nytune")));
+    }
+}
+
+fn install_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontFamily};
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("dejavu".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("fonts/DejaVuSans.ttf"))));
+    let mut extra: Vec<String> = vec!["dejavu".into()];
+    let sys = [
+        ("C:\\Windows\\Fonts\\seguisym.ttf", "sys_sym"),
+        ("C:\\Windows\\Fonts\\msyh.ttc", "sys_cjk1"),
+        ("C:\\Windows\\Fonts\\YuGothM.ttc", "sys_cjk2"),
+        ("C:\\Windows\\Fonts\\malgun.ttf", "sys_cjk3"),
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "sys_cjk4"),
+        ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", "sys_cjk5"),
+        ("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", "sys_cjk6"),
+        ("/usr/share/fonts/TTF/NotoSansCJK-Regular.ttc", "sys_cjk7"),
+        ("/System/Library/Fonts/PingFang.ttc", "sys_cjk8"),
+        ("/System/Library/Fonts/Apple Symbols.ttf", "sys_sym2"),
+    ];
+    for (path, key) in sys {
+        if let Ok(bytes) = std::fs::read(path) {
+            if bytes.len() < 64 * 1024 * 1024 {
+                fonts.font_data.insert(key.into(), std::sync::Arc::new(FontData::from_owned(bytes)));
+                extra.push(key.into());
+            }
+        }
+    }
+    for fam in [FontFamily::Monospace, FontFamily::Proportional] {
+        if let Some(list) = fonts.families.get_mut(&fam) {
+            // after the primary font, before the emoji fall-backs
+            let at = list.len().min(2);
+            for (k, name) in extra.iter().enumerate() {
+                list.insert(at + k, name.clone());
+            }
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
 fn toggle_note(setter: &ParamSetter, p: &NyashkTuneParams, pc: usize) {
     let mut m = p.allowed_mask();
     m ^= 1 << pc;
@@ -608,6 +743,9 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
         last_target: 0.0,
         voiced: false,
         tab: 0,
+        user: list_user_presets(),
+        user_sel: None,
+        save_name: None,
     };
     let editor_state = params.editor_state.clone();
     let size_state = editor_state.clone();
@@ -638,6 +776,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
             v.popup_shadow = egui::Shadow::NONE;
             v.window_shadow = egui::Shadow::NONE;
             ctx.set_visuals(v);
+            install_fonts(ctx);
         },
         move |ctx, setter, st| {
             ctx.request_repaint_after(Duration::from_millis(33));
@@ -688,15 +827,31 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 painter.hline(o.x + 14.0..=o.x + 886.0, o.y + 58.0, Stroke::new(1.0_f32, LINE));
 
                 // preset
-                let cur_preset = (p.preset.load(Ordering::Relaxed) as usize).min(PRESETS.len() - 1);
+                let cur_raw = p.preset.load(Ordering::Relaxed) as usize;
+                let cur_label = if cur_raw < PRESETS.len() {
+                    PRESETS[cur_raw].to_string()
+                } else {
+                    st.user_sel.clone().map(|n| format!("* {n}")).unwrap_or_else(|| "User preset".to_string())
+                };
                 ui.allocate_new_ui(UiBuilder::new().max_rect(rect(158.0, 17.0, 164.0, 28.0)), |ui| {
                     egui::ComboBox::from_id_salt("preset")
                         .width(142.0)
-                        .selected_text(egui::RichText::new(PRESETS[cur_preset]).font(mono(12.0)))
+                        .selected_text(egui::RichText::new(cur_label).font(mono(12.0)))
                         .show_ui(ui, |ui| {
                             for (i, n) in PRESETS.iter().enumerate() {
-                                if ui.selectable_label(i == cur_preset, egui::RichText::new(*n).font(mono(12.0))).clicked() {
+                                if ui.selectable_label(i == cur_raw, egui::RichText::new(*n).font(mono(12.0))).clicked() {
                                     apply_preset(setter, p, i);
+                                    st.user_sel = None;
+                                }
+                            }
+                            if !st.user.is_empty() {
+                                ui.separator();
+                                for n in st.user.clone() {
+                                    let sel = cur_raw >= PRESETS.len() && st.user_sel.as_deref() == Some(n.as_str());
+                                    if ui.selectable_label(sel, egui::RichText::new(format!("* {n}")).font(mono(12.0))).clicked() && load_user_preset(setter, p, &n) {
+                                        p.preset.store(u32::MAX, Ordering::Relaxed);
+                                        st.user_sel = Some(n);
+                                    }
                                 }
                             }
                         });
@@ -799,10 +954,51 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                         st.tab = i;
                     }
                 }
-                {
-                    let nv = p.voices.iter().filter(|v| v.on.value()).count();
-                    let txt = format!("formant: {}   voices: {}", p.fmode.value().to_string_name(), nv);
-                    painter.text(Pos2::new(o.x + 886.0, o.y + 317.0), Align2::RIGHT_CENTER, txt, mono(10.0), DIM);
+                if let Some(mut buf) = st.save_name.clone() {
+                    let te = egui::TextEdit::singleline(&mut buf).font(mono(11.0)).desired_width(160.0).margin(egui::Margin::symmetric(6, 4));
+                    let r_te = ui.put(rect(384.0, 304.0, 172.0, 26.0), te);
+                    if !r_te.has_focus() && !r_te.lost_focus() {
+                        r_te.request_focus();
+                    }
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    let ok = pill(ui, rect(562.0, 304.0, 40.0, 26.0), "OK", false) || enter;
+                    let cancel = pill(ui, rect(606.0, 304.0, 28.0, 26.0), "X", false) || esc;
+                    if ok {
+                        if let Ok(n) = save_user_preset(p, &buf) {
+                            st.user = list_user_presets();
+                            st.user_sel = Some(n);
+                            p.preset.store(u32::MAX, Ordering::Relaxed);
+                        }
+                        st.save_name = None;
+                    } else if cancel {
+                        st.save_name = None;
+                    } else {
+                        st.save_name = Some(buf);
+                    }
+                } else {
+                    if pill(ui, rect(384.0, 304.0, 104.0, 26.0), "SAVE PRESET", false) {
+                        st.save_name = Some(st.user_sel.clone().unwrap_or_else(|| "My preset".to_string()));
+                    }
+                    if st.user_sel.is_some() && p.preset.load(Ordering::Relaxed) as usize >= PRESETS.len() && pill(ui, rect(494.0, 304.0, 70.0, 26.0), "DELETE", false) {
+                        if let Some(n) = st.user_sel.take() {
+                            delete_user_preset(&n);
+                            st.user = list_user_presets();
+                        }
+                    }
+                    // module switches: whatever is off is not computed at all
+                    painter.text(Pos2::new(o.x + 598.0 - 8.0, o.y + 317.0), Align2::RIGHT_CENTER, "modules", mono(9.5), DIM);
+                    let mods: [(&str, bool); 4] = [("FORMANT", p.formant_on.value()), ("VOICES", p.voices_on.value()), ("COLOUR", p.colour_on.value()), ("VIBRATO", p.vib_on.value())];
+                    for (i, (t, on)) in mods.iter().enumerate() {
+                        if pill(ui, rect(598.0 + 72.0 * i as f32, 304.0, 68.0, 26.0), t, *on) {
+                            match i {
+                                0 => set_b(setter, &p.formant_on, !on),
+                                1 => set_b(setter, &p.voices_on, !on),
+                                2 => set_b(setter, &p.colour_on, !on),
+                                _ => set_b(setter, &p.vib_on, !on),
+                            }
+                        }
+                    }
                 }
 
                 let row1 = 338.0;
@@ -923,6 +1119,12 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
 
                     let g2 = group(ui, 214.0, row1, 672.0, "02", "FORMANT");
                     enum_combo(ui, setter, &p.fmode, "fmode", Rect::from_min_size(Pos2::new(g2.left() + 112.0, g2.top() + 6.0), Vec2::new(150.0, 20.0)));
+                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 270.0, g2.top() + 6.0), Vec2::new(44.0, 18.0)), "ON", p.formant_on.value()) {
+                        set_b(setter, &p.formant_on, !p.formant_on.value());
+                    }
+                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 322.0, g2.top() + 6.0), Vec2::new(98.0, 18.0)), "COLOUR ON", p.colour_on.value()) {
+                        set_b(setter, &p.colour_on, !p.colour_on.value());
+                    }
                     if pill(ui, Rect::from_min_size(Pos2::new(g2.right() - 106.0, g2.top() + 6.0), Vec2::new(98.0, 18.0)), "KEEP FORMANTS", p.keep_formants.value()) {
                         set_b(setter, &p.keep_formants, !p.keep_formants.value());
                     }
@@ -1027,4 +1229,28 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
             });
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_presets_roundtrip_files() {
+        let dir = std::env::temp_dir().join(format!("nyashk-test-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::set_var("APPDATA", &dir);
+        std::env::set_var("HOME", &dir);
+        let p = NyashkTuneParams::default();
+        assert_eq!(clean_preset_name("  a/b:c*d?\"e<f>g|h\\i  "), "abcdefghi");
+        assert!(save_user_preset(&p, "   ").is_err());
+        let n = save_user_preset(&p, "Мій пресет: ♥").unwrap();
+        assert_eq!(n, "Мій пресет ♥");
+        assert!(list_user_presets().contains(&n));
+        let text = std::fs::read_to_string(preset_dir().unwrap().join(format!("{n}.nytune"))).unwrap();
+        assert!(text.contains("retune=") && text.contains("fmode=") && text.contains("@note_bypass=0") && !text.contains("\nbypass="));
+        delete_user_preset(&n);
+        assert!(!list_user_presets().contains(&n));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
