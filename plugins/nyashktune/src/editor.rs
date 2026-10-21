@@ -440,26 +440,51 @@ fn clean_preset_name(n: &str) -> String {
     n.trim().chars().filter(|c| !c.is_control() && !"/\\:*?\"<>|".contains(*c)).collect::<String>().trim().to_string()
 }
 
+fn user_path(name: &str, cat: &str) -> Option<std::path::PathBuf> {
+    let d = preset_dir()?;
+    let sub = d.join(cat).join(format!("{name}.nytune"));
+    if cat != "User" && sub.is_file() {
+        return Some(sub);
+    }
+    Some(d.join(format!("{name}.nytune")))
+}
+
+/// (name, category). Files inside a category folder belong to that category;
+/// loose files in the root use their `@cat=` line (or "User").
 fn list_user_presets() -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = Vec::new();
-    if let Some(d) = preset_dir() {
-        if let Ok(rd) = std::fs::read_dir(d) {
+    let Some(root) = preset_dir() else { return v };
+    let mut scan = |dir: &std::path::Path, folder_cat: Option<&str>| {
+        if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let path = e.path();
                 if path.extension().and_then(|x| x.to_str()) == Some("nytune") {
                     if let Some(n) = path.file_stem().and_then(|x| x.to_str()) {
-                        let cat = std::fs::read_to_string(&path)
-                            .ok()
-                            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("@cat=").map(|c| c.trim().to_string())))
-                            .filter(|c| !c.is_empty())
-                            .unwrap_or_else(|| "User".to_string());
+                        let cat = match folder_cat {
+                            Some(c) => c.to_string(),
+                            None => std::fs::read_to_string(&path)
+                                .ok()
+                                .and_then(|t| t.lines().find_map(|l| l.strip_prefix("@cat=").map(|c| c.trim().to_string())))
+                                .filter(|c| !c.is_empty())
+                                .unwrap_or_else(|| "User".to_string()),
+                        };
                         v.push((n.to_string(), cat));
                     }
                 }
             }
         }
+    };
+    scan(&root, None);
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                if let Some(c) = e.file_name().to_str() {
+                    scan(&e.path(), Some(c));
+                }
+            }
+        }
     }
-    v.sort_by_key(|a| a.0.to_lowercase());
+    v.sort_by_key(|a| (a.1.to_lowercase(), a.0.to_lowercase()));
     v
 }
 
@@ -500,7 +525,8 @@ fn save_user_preset(p: &NyashkTuneParams, name: &str, cat: &str) -> std::io::Res
     }
     let cat = clean_preset_name(cat);
     let cat = if cat.is_empty() { "User".to_string() } else { cat };
-    let dir = preset_dir().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no config folder"))?;
+    let root = preset_dir().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no config folder"))?;
+    let dir = if cat == "User" { root.clone() } else { root.join(&cat) };
     std::fs::create_dir_all(&dir)?;
     let mut out = String::from("NyashkTune preset v1\n");
     out.push_str(&format!("@cat={cat}\n"));
@@ -517,9 +543,9 @@ fn save_user_preset(p: &NyashkTuneParams, name: &str, cat: &str) -> std::io::Res
     Ok(name)
 }
 
-fn load_user_preset(setter: &ParamSetter, p: &NyashkTuneParams, name: &str) -> bool {
-    let Some(dir) = preset_dir() else { return false };
-    let Ok(text) = std::fs::read_to_string(dir.join(format!("{name}.nytune"))) else { return false };
+fn load_user_preset(setter: &ParamSetter, p: &NyashkTuneParams, name: &str, cat: &str) -> bool {
+    let Some(path) = user_path(name, cat) else { return false };
+    let Ok(text) = std::fs::read_to_string(path) else { return false };
     let mut map = std::collections::HashMap::new();
     for line in text.lines() {
         if let Some((k, v)) = line.split_once('=') {
@@ -545,10 +571,24 @@ fn load_user_preset(setter: &ParamSetter, p: &NyashkTuneParams, name: &str) -> b
     true
 }
 
-fn delete_user_preset(name: &str) {
-    if let Some(dir) = preset_dir() {
-        let _ = std::fs::remove_file(dir.join(format!("{name}.nytune")));
+/// Delete the file; a category folder left empty goes away too (never the root).
+fn delete_user_preset(name: &str, cat: &str) {
+    if let (Some(root), Some(path)) = (preset_dir(), user_path(name, cat)) {
+        let _ = std::fs::remove_file(&path);
+        if let Some(dir) = path.parent() {
+            if dir != root && dir.starts_with(&root) {
+                let _ = std::fs::remove_dir(dir);
+            }
+        }
     }
+}
+
+fn open_preset_folder(cat: &str) {
+    let Some(root) = preset_dir() else { return };
+    let d = if cat != "User" && root.join(cat).is_dir() { root.join(cat) } else { root };
+    let _ = std::fs::create_dir_all(&d);
+    let cmd = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(cmd).arg(d).spawn();
 }
 
 fn install_fonts(ctx: &egui::Context) {
@@ -903,7 +943,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                             if i < n_fac {
                                 apply_preset(setter, p, i);
                                 st.user_sel = None;
-                            } else if load_user_preset(setter, p, &items[i].name) {
+                            } else if load_user_preset(setter, p, &items[i].name, &items[i].cat) {
                                 p.preset.store(u32::MAX, Ordering::Relaxed);
                                 st.user_sel = Some(items[i].name.clone());
                                 st.save_name = items[i].name.clone();
@@ -920,6 +960,19 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                             e.1 = v;
                             save_meta(&st.meta);
                         }
+                        BAct::Delete(i) => {
+                            let (n, c) = (items[i].name.clone(), items[i].cat.clone());
+                            delete_user_preset(&n, &c);
+                            st.user = list_user_presets();
+                            if st.user_sel.as_ref() == Some(&n) {
+                                st.user_sel = None;
+                            }
+                            if !st.user.iter().any(|(_, uc)| *uc == c) && st.bs.cat == c {
+                                st.bs.cat.clear();
+                            }
+                            st.msg = format!("deleted \"{n}\"");
+                        }
+                        BAct::OpenFolder(i) => open_preset_folder(&items[i].cat),
                         BAct::Close => st.browser = false,
                         BAct::None => {}
                     }
@@ -943,19 +996,8 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                             Err(e) => st.msg = format!("not saved: {e}"),
                         }
                     }
-                    if let Some(n) = st.user_sel.clone().filter(|_| cur_raw >= n_fac) {
-                        if pill(ui, Rect::from_min_size(Pos2::new(cr.right() + 88.0, y), Vec2::new(70.0, 24.0)), "DELETE", false) {
-                            delete_user_preset(&n);
-                            st.user = list_user_presets();
-                            st.user_sel = None;
-                            st.msg = format!("deleted \"{n}\"");
-                        }
-                    }
                     if !st.msg.is_empty() {
                         painter.text(Pos2::new(f.left(), y + 40.0), Align2::LEFT_CENTER, &st.msg, mono(10.0), MID);
-                    }
-                    if let Some(d) = preset_dir() {
-                        painter.text(Pos2::new(f.right(), y + 40.0), Align2::RIGHT_CENTER, d.display().to_string(), mono(9.0), DIM);
                     }
                     return;
                 }
@@ -1008,8 +1050,8 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     if i < n_fac {
                         apply_preset(setter, p, i);
                         st.user_sel = None;
-                    } else if let Some((n, _)) = st.user.get(i - n_fac).cloned() {
-                        if load_user_preset(setter, p, &n) {
+                    } else if let Some((n, c)) = st.user.get(i - n_fac).cloned() {
+                        if load_user_preset(setter, p, &n, &c) {
                             p.preset.store(u32::MAX, Ordering::Relaxed);
                             st.user_sel = Some(n);
                         }
@@ -1335,9 +1377,11 @@ mod tests {
         let n = save_user_preset(&p, "Мій пресет: ♥", "Мої").unwrap();
         assert_eq!(n, "Мій пресет ♥");
         assert!(list_user_presets().contains(&(n.clone(), "Мої".to_string())));
-        let text = std::fs::read_to_string(preset_dir().unwrap().join(format!("{n}.nytune"))).unwrap();
+        let text = std::fs::read_to_string(preset_dir().unwrap().join("Мої").join(format!("{n}.nytune"))).unwrap();
         assert!(text.contains("retune=") && text.contains("fmode=") && text.contains("@note_bypass=0") && !text.contains("\nbypass="));
-        delete_user_preset(&n);
+        assert!(preset_dir().unwrap().join("Мої").is_dir());
+        delete_user_preset(&n, "Мої");
+        assert!(!preset_dir().unwrap().join("Мої").exists(), "empty category folder must go");
         assert!(!list_user_presets().iter().any(|(x, _)| *x == n));
         let _ = std::fs::remove_dir_all(&dir);
     }

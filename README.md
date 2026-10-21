@@ -44,7 +44,7 @@ Realtime vocal pitch correction, from transparent, natural-sounding tuning to th
 
 ### Preset browser
 
-`<` name `>` flips through presets, clicking the name opens the browser: categories, search, favourites, 1-5 star ratings, factory + your own presets. **SAVE** (header) opens it with the save line: name + category -> **SAVE**, **DELETE** removes a user preset.
+`<` name `>` flips through presets, clicking the name opens the browser: categories, search, favourites, 1-5 star ratings, factory + your own presets. **SAVE** (header) opens it with the save line: name + category -> **SAVE**. Each category is a folder inside the presets folder. **Right-click** one of your presets: **Delete** removes the file (an emptied category folder disappears too), **Open folder** shows it in your file manager.
 
 ### Latency
 
@@ -76,7 +76,7 @@ Chromatic · Major · Natural Minor · Harmonic Minor · Melodic Minor · Major 
 
 Init (Major, 50 ms) · Natural Correction · Transparent Pop · Smooth R&B · Hard Tune (T-Pain) · Hard Tune Major · Minor Pentatonic Rap · Robot Voice · Gender Up · Gender Down · Add Vibrato · MIDI Target · **Anime Vocal** · Anime Vocal - Soft · Anime Vocal - Hyper · Anime Idol (Duet Layers) · Chipmunk · Giant / Demon · Robot Choir · Octave Doubler · Thirds Harmony · Gospel Choir · Stereo Double (ADT) · Alien Throat · Wobbly Vibrato · Telephone Singer · Whisper Child · Formant Lab (LPC +3)
 
-The *Anime* presets are a bright, small-vocal-tract starting point (formants up, fast tune, airy top, an octave shimmer and a detuned double). Set KEY / SCALE (or **DETECT** it) for your song and trim Shift / Transpose to taste.
+The *Anime* presets are a bright, small-vocal-tract starting point (formants up, fast tune, airy top, an octave shimmer and a detuned double). Set KEY / SCALE for your song and trim Shift / Transpose to taste.
 
 </details>
 

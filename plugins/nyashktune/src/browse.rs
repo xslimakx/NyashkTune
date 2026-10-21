@@ -24,6 +24,8 @@ pub enum BAct {
     Pick(usize),
     Fav(usize),
     Rate(usize, u8),
+    Delete(usize),
+    OpenFolder(usize),
     Close,
 }
 
@@ -186,6 +188,18 @@ pub fn browser(ui: &mut Ui, rect: Rect, title: &str, items: &[BItem], sel: Optio
         }
         if resp.clicked() {
             act = BAct::Pick(i);
+        }
+        if it.user {
+            resp.context_menu(|ui| {
+                if ui.button("Delete").clicked() {
+                    act = BAct::Delete(i);
+                    ui.close_menu();
+                }
+                if ui.button("Open folder").clicked() {
+                    act = BAct::OpenFolder(i);
+                    ui.close_menu();
+                }
+            });
         }
     }
     if total > list_r.height() {
