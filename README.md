@@ -44,7 +44,7 @@ Realtime vocal pitch correction, from transparent, natural-sounding tuning to th
 
 ### Preset browser
 
-`<` name `>` flips through presets, clicking the name opens the browser: categories, search, favourites, 1-5 star ratings, factory + your own presets. **SAVE** (header) opens it with the save line: name + category -> **SAVE**. Each category is a folder inside the presets folder. **Right-click** one of your presets: **Delete** removes the file (an emptied category folder disappears too), **Open folder** shows it in your file manager.
+`<` name `>` flips through presets, clicking the name opens the browser: categories, search, favourites, 1-5 star ratings, factory + your own presets. **SAVE** (header) opens it with the save line: name + category -> **SAVE**. Each category is a folder inside the presets folder. Click one of your presets to select it: **DELETE** removes the file (an emptied category folder disappears too), **OPEN FOLDER** shows the preset folder in your file manager, **RESCAN** reloads it.
 
 ### Latency
 

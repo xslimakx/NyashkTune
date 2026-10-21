@@ -960,19 +960,6 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                             e.1 = v;
                             save_meta(&st.meta);
                         }
-                        BAct::Delete(i) => {
-                            let (n, c) = (items[i].name.clone(), items[i].cat.clone());
-                            delete_user_preset(&n, &c);
-                            st.user = list_user_presets();
-                            if st.user_sel.as_ref() == Some(&n) {
-                                st.user_sel = None;
-                            }
-                            if !st.user.iter().any(|(_, uc)| *uc == c) && st.bs.cat == c {
-                                st.bs.cat.clear();
-                            }
-                            st.msg = format!("deleted \"{n}\"");
-                        }
-                        BAct::OpenFolder(i) => open_preset_folder(&items[i].cat),
                         BAct::Close => st.browser = false,
                         BAct::None => {}
                     }
@@ -980,10 +967,10 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     let f = browse::footer(area);
                     let y = f.top() + 4.0;
                     painter.text(Pos2::new(f.left(), y + 12.0), Align2::LEFT_CENTER, "SAVE AS", mono(10.0), DIM);
-                    let nr = Rect::from_min_size(Pos2::new(f.left() + 62.0, y), Vec2::new(250.0, 24.0));
+                    let nr = Rect::from_min_size(Pos2::new(f.left() + 62.0, y), Vec2::new(200.0, 24.0));
                     ui.put(nr, egui::TextEdit::singleline(&mut st.save_name).font(mono(12.0)).hint_text("preset name").desired_width(nr.width()).margin(egui::Margin::symmetric(6, 4)));
                     painter.text(Pos2::new(nr.right() + 14.0, y + 12.0), Align2::LEFT_CENTER, "CATEGORY", mono(10.0), DIM);
-                    let cr = Rect::from_min_size(Pos2::new(nr.right() + 84.0, y), Vec2::new(170.0, 24.0));
+                    let cr = Rect::from_min_size(Pos2::new(nr.right() + 84.0, y), Vec2::new(150.0, 24.0));
                     ui.put(cr, egui::TextEdit::singleline(&mut st.save_cat).font(mono(12.0)).hint_text("Vocal, Fun, Mine...").desired_width(cr.width()).margin(egui::Margin::symmetric(6, 4)));
                     if pill(ui, Rect::from_min_size(Pos2::new(cr.right() + 10.0, y), Vec2::new(70.0, 24.0)), "SAVE", true) {
                         match save_user_preset(p, &st.save_name, &st.save_cat) {
@@ -996,8 +983,29 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                             Err(e) => st.msg = format!("not saved: {e}"),
                         }
                     }
+                    if let Some((n, c)) = st.user_sel.clone().filter(|_| cur_raw >= n_fac).and_then(|n| st.user.iter().find(|(u, _)| *u == n).cloned()) {
+                        if pill(ui, Rect::from_min_size(Pos2::new(cr.right() + 88.0, y), Vec2::new(70.0, 24.0)), "DELETE", false) {
+                            delete_user_preset(&n, &c);
+                            st.user = list_user_presets();
+                            st.user_sel = None;
+                            if !st.user.iter().any(|(_, uc)| *uc == c) && st.bs.cat == c {
+                                st.bs.cat.clear();
+                            }
+                            st.msg = format!("deleted \"{n}\"");
+                        }
+                    }
+                    if pill(ui, Rect::from_min_size(Pos2::new(f.right() - 210.0, y), Vec2::new(116.0, 24.0)), "OPEN FOLDER", false) {
+                        let c = st.user_sel.clone().and_then(|n| st.user.iter().find(|(u, _)| *u == n).map(|x| x.1.clone())).unwrap_or_else(|| "User".into());
+                        open_preset_folder(&c);
+                    }
+                    if pill(ui, Rect::from_min_size(Pos2::new(f.right() - 88.0, y), Vec2::new(88.0, 24.0)), "RESCAN", false) {
+                        st.user = list_user_presets();
+                        st.msg = "folders rescanned".into();
+                    }
                     if !st.msg.is_empty() {
                         painter.text(Pos2::new(f.left(), y + 40.0), Align2::LEFT_CENTER, &st.msg, mono(10.0), MID);
+                    } else {
+                        painter.text(Pos2::new(f.left(), y + 40.0), Align2::LEFT_CENTER, "Click: load. Stars: rating (left), favorite (right). Select one of yours to DELETE it.", mono(9.5), DIM);
                     }
                     return;
                 }

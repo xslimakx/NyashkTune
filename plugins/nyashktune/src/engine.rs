@@ -328,6 +328,7 @@ pub struct Engine {
     started: bool,
     syn: [Synth; NUM_VOICES + 1],
     vact: [bool; NUM_VOICES + 1],
+    vcomp: f32,                // smoothed output level compensation while voices are on
     vdelta: [f64; NUM_VOICES], // smoothed interval (semitones) of the extra voices
     cur_r: f64,                // pitch ratio chosen for the lead's latest grain
     shifter: FormantShifter,
@@ -402,6 +403,7 @@ impl Engine {
             syn: [Synth::default(); NUM_VOICES + 1],
             vact: [false; NUM_VOICES + 1],
             vdelta: [0.0; NUM_VOICES],
+            vcomp: 1.0,
             cur_r: 1.0,
             shifter: FormantShifter::new(((8.0 * fs / 40.0).ceil() as usize + 64).next_power_of_two()),
             gbuf: [vec![0.0; (4.0 * fs / 40.0).ceil() as usize + 64], vec![0.0; (4.0 * fs / 40.0).ceil() as usize + 64]],
@@ -457,6 +459,7 @@ impl Engine {
         self.syn = [Synth { prev_hs: self.fs / 150.0, ..Synth::default() }; NUM_VOICES + 1];
         self.vact = [false; NUM_VOICES + 1];
         self.vdelta = [0.0; NUM_VOICES];
+        self.vcomp = 1.0;
         self.cur_r = 1.0;
         for a in self.air.iter_mut() {
             a.z1 = 0.0;
@@ -570,9 +573,29 @@ impl Engine {
         let oi = (o & self.ring_mask) as usize;
         let drive = if self.p.colour_on { self.p.drive.clamp(0.0, 1.0) } else { 0.0 };
         let air_on = self.p.colour_on && self.p.air_db.abs() > 0.05;
+        // Voices add to the lead: keep the sum from running away (power sum, only when it would
+        // be well above unity), then a soft knee as a last safety so nothing hard-clips.
+        let mut pw = 1.0f32;
+        let mut any_v = false;
+        for v in 0..NUM_VOICES {
+            if self.p.voices_on && self.p.voices[v].on && !self.p.bypass {
+                let lv = 10f32.powf(self.p.voices[v].level_db / 20.0);
+                pw += lv * lv;
+                any_v = true;
+            }
+        }
+        let comp_t = if any_v { (1.25 / pw.sqrt()).min(1.0) } else { 1.0 };
+        self.vcomp += (comp_t - self.vcomp) * (1.0 / (0.03 * self.fs as f32)).min(1.0);
         for c in 0..nch {
             let mut wet = self.ola[c][oi];
             self.ola[c][oi] = 0.0;
+            if any_v || self.vcomp != 1.0 {
+                wet *= self.vcomp;
+                let a = wet.abs();
+                if a > 0.85 {
+                    wet = wet.signum() * (0.85 + 0.15 * ((a - 0.85) / 0.15).tanh());
+                }
+            }
             if air_on {
                 wet = self.air[c].tick(wet as f64) as f32;
             }
@@ -1103,7 +1126,11 @@ impl Engine {
 
         sy.next_centre = tc + hs;
         // continue from the chosen mark; slowly pull back towards the nominal latency
-        let nom = m as f64 + hs;
+        // Normally continue from the chosen mark. When the grains are much denser than the
+        // pitch marks (strong upward shift, hs < p), the nearest mark would be picked again and
+        // again and the content would fall behind real time - so then advance the nominal
+        // position by exactly one hop and let the mark picker repeat marks as needed.
+        let nom = if hs < 0.75 * p { sy.content_nom + hs } else { m as f64 + hs };
         let lag_err = (sy.next_centre - self.latency as f64) - nom;
         sy.content_nom = nom + (self.pull * lag_err).clamp(-0.5 * hs, 0.5 * hs);
         sy.prev_hs = hs;
@@ -1150,6 +1177,83 @@ mod fuzz_tests {
             out.push((y * 0.3 * gate) as f32);
         }
         out
+    }
+
+    /// A voice far above the lead (hs << pitch period) must stay locked to real time and clean,
+    /// and the sum of loud voices must not clip.
+    #[test]
+    fn high_voice_stays_in_time_and_sum_does_not_clip() {
+        let fs = 48000.0f64;
+        let n = (fs * 3.0) as usize;
+        let f0 = 220.0f64;
+        // simple vowel-like pulse train, 2 resonances
+        let (mut y1, mut y2, mut z1, mut z2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let ph = (i as f64 * f0 / fs) % 1.0;
+                let src = if ph < 0.05 { 1.0 } else { -0.05 };
+                let r = 0.985;
+                let th = 2.0 * PI * 700.0 / fs;
+                let y = src * 0.1 + 2.0 * r * th.cos() * y1 - r * r * y2;
+                y2 = y1;
+                y1 = y;
+                let th2 = 2.0 * PI * 1500.0 / fs;
+                let z = y * 0.1 + 2.0 * r * th2.cos() * z1 - r * r * z2;
+                z2 = z1;
+                z1 = z;
+                (z * 3.0) as f32
+            })
+            .collect();
+        let peak_in = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let x: Vec<f32> = x.iter().map(|v| v * 0.5 / peak_in).collect();
+        let run = |iv: f32, lvl: f32, n_on: usize| -> Vec<f32> {
+            let mut e = Engine::new(fs, 70.0);
+            let mut p = Params::default();
+            p.scale = 0; // chromatic
+            p.retune_ms = 50.0;
+            for k in 0..n_on {
+                p.voices[k] = VoiceParams { on: true, interval: iv, level_db: lvl, ..VoiceParams::default() };
+            }
+            let mut out = Vec::with_capacity(n);
+            for ch in x.chunks(128) {
+                e.set_params(&p);
+                for &s in ch {
+                    out.push(e.process_frame([s, s], 1)[0]);
+                }
+            }
+            out
+        };
+        // voice-only signal = with voice minus without
+        let base = run(0.0, -9.0, 0);
+        let hi = run(24.0, 0.0, 1);
+        let v: Vec<f32> = hi.iter().zip(&base).skip(fs as usize).map(|(a, b)| a - b).collect();
+        let fv = f0 * 4.0;
+        let (mut harm, mut tot) = (0.0f64, 0.0f64);
+        for k in 1..=18 {
+            // Goertzel-ish single-bin DFT energy around k*fv and in between
+            for (fr, is_h) in [(k as f64 * fv, true), (k as f64 * fv + fv / 2.0, false)] {
+                if fr > 8000.0 {
+                    continue;
+                }
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (i, s) in v.iter().enumerate() {
+                    let w = 0.5 - 0.5 * (2.0 * PI * i as f64 / v.len() as f64).cos();
+                    let a = 2.0 * PI * fr * i as f64 / fs;
+                    re += *s as f64 * w * a.cos();
+                    im += *s as f64 * w * a.sin();
+                }
+                let e = re * re + im * im;
+                tot += e;
+                if is_h {
+                    harm += e;
+                }
+            }
+        }
+        assert!(harm / tot > 0.9, "+24 st voice is not harmonic: {:.2}", harm / tot);
+        // two loud voices: no hard clipping
+        let loud = run(12.0, 6.0, 2);
+        let pk = loud.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        assert!(pk < 1.0, "peak {pk}");
     }
 
     #[test]
