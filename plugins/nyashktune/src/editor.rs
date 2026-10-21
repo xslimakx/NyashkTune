@@ -1108,8 +1108,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 }
 
                 // ---- tabs
-                let learning = meters.learn_on.load(Ordering::Relaxed);
-                for (i, t) in ["TUNE", "FORMANT", "VOICES", if learning { "KEY \u{25CF}" } else { "KEY" }].iter().enumerate() {
+                for (i, t) in ["TUNE", "FORMANT", "VOICES"].iter().enumerate() {
                     if pill(ui, rect(14.0 + i as f32 * 100.0, 304.0, 96.0, 26.0), t, st.tab == i) {
                         st.tab = i;
                     }
@@ -1266,7 +1265,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                         painter.text(Pos2::new(g4.left() + 14.0, g4.top() + 72.0 + 17.0 * i as f32), Align2::LEFT_CENTER, *l, mono(10.5), MID);
                     }
                     painter.text(Pos2::new(g4.left() + 14.0, g4.bottom() - 18.0), Align2::LEFT_CENTER, "Tip: KEEP FORMANTS on = formants stay where you set them.", mono(9.5), DIM);
-                } else if st.tab == 2 {
+                } else {
                     for i in 0..2 {
                         let y = if i == 0 { row1 } else { row2 };
                         let g = group(ui, 14.0, y, 872.0, if i == 0 { "01" } else { "02" }, if i == 0 { "VOICE 1" } else { "VOICE 2" });
@@ -1291,55 +1290,6 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                         knob_id(ui, setter, &v.detune, "Detune", &format!("v{n}_det"), c[3], "Fine pitch offset: a few cents gives a chorus / double-tracked feel.", true);
                         knob_id(ui, setter, &v.formant, "Formant", &format!("v{n}_fmt"), c[4], "Extra formant shift for this voice only.", true);
                         knob_id(ui, setter, &v.delay, "Delay", &format!("v{n}_dly"), c[5], "Small delay (10-30 ms) makes it a separate 'person'.", false);
-                    }
-                } else {
-                    // ---- KEY: learn which notes you sing, find the key / build a scale. Only counts while LEARNING is on.
-                    let g = group(ui, 14.0, row1, 872.0, "01", "NOTES YOU SING");
-                    let hist: [f32; 12] = std::array::from_fn(|i| meters.hist[i].load(Ordering::Relaxed) as f32);
-                    let total: f32 = hist.iter().sum();
-                    let mx = hist.iter().cloned().fold(0.0f32, f32::max).max(1.0);
-                    let bars = Rect::from_min_size(Pos2::new(g.left() + 16.0, g.top() + 34.0), Vec2::new(g.width() - 32.0, g.height() - 44.0));
-                    let bw = bars.width() / 12.0;
-                    for i in 0..12 {
-                        let h = hist[i] / mx * (bars.height() - 18.0);
-                        let x0 = bars.left() + bw * i as f32;
-                        let base = bars.bottom() - 18.0;
-                        if h > 0.5 {
-                            painter.rect_filled(Rect::from_min_max(Pos2::new(x0 + 6.0, base - h), Pos2::new(x0 + bw - 6.0, base)), CornerRadius::same(3), if hist[i] >= mx * 0.12 { WHITE } else { MID });
-                        }
-                        painter.hline(x0 + 4.0..=x0 + bw - 4.0, base, Stroke::new(1.0_f32, LINE));
-                        painter.text(Pos2::new(x0 + bw * 0.5, bars.bottom() - 7.0), Align2::CENTER_CENTER, NOTE_NAMES[i], mono(10.0), if is_black(i) { DIM } else { WHITE });
-                    }
-                    let det = if total > 3000.0 { engine::detect_key(&hist) } else { None };
-                    let g2 = group(ui, 14.0, row2, 872.0, "02", "KEY DETECT / LEARN SCALE");
-                    let txt = match det {
-                        Some((k, sc, c)) => format!("you sing in:  {} {}   ({:.0}% match)", NOTE_NAMES[k], if sc == 1 { "major" } else { "minor" }, (c * 100.0).max(0.0)),
-                        None if learning => "listening... sing a phrase".to_string(),
-                        None => "press START and sing for a few seconds".to_string(),
-                    };
-                    painter.text(Pos2::new(g2.left() + 16.0, g2.top() + 46.0), Align2::LEFT_CENTER, txt, mono(14.0), if det.is_some() { WHITE } else { DIM });
-                    painter.text(Pos2::new(g2.left() + 16.0, g2.top() + 72.0), Align2::LEFT_CENTER, "Counting runs only while LEARNING is on (it uses no CPU otherwise). Turn it off when you are done.", mono(10.0), MID);
-                    let py = g2.top() + 100.0;
-                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 16.0, py), Vec2::new(130.0, 30.0)), if learning { "STOP LEARNING" } else { "START LEARNING" }, learning) {
-                        meters.learn_on.store(!learning, Ordering::Relaxed);
-                    }
-                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 156.0, py), Vec2::new(130.0, 30.0)), "SET KEY + SCALE", false) {
-                        if let Some((k, sc, _)) = det {
-                            set_e(setter, &p.key, Key::from_index(k));
-                            set_e(setter, &p.scale, if sc == 1 { ScaleKind::Major } else { ScaleKind::NaturalMinor });
-                            meters.learn_on.store(false, Ordering::Relaxed);
-                        }
-                    }
-                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 296.0, py), Vec2::new(150.0, 30.0)), "MAKE CUSTOM SCALE", false) && total > 3000.0 {
-                        let m = engine::learn_mask(&hist, 0.12);
-                        for (i, n) in p.notes.iter().enumerate() {
-                            set_b(setter, &n.on, (m >> i) & 1 == 1);
-                        }
-                        set_e(setter, &p.scale, ScaleKind::Custom);
-                        meters.learn_on.store(false, Ordering::Relaxed);
-                    }
-                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 456.0, py), Vec2::new(80.0, 30.0)), "CLEAR", false) {
-                        meters.hist_reset.store(true, Ordering::Relaxed);
                     }
                 }
 

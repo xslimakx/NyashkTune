@@ -21,7 +21,7 @@ Realtime vocal pitch correction, from transparent, natural-sounding tuning to th
 
 <p align="center"><img src="docs/img/nyashktune-tune.png" alt="NyashkTune - TUNE tab" width="820"></p>
 <p align="center"><img src="docs/img/nyashktune-formant.png" alt="FORMANT tab" width="410"> <img src="docs/img/nyashktune-voices.png" alt="VOICES tab" width="410"></p>
-<p align="center"><img src="docs/img/nyashktune-presets.png" alt="Preset browser" width="410"> <img src="docs/img/nyashktune-key.png" alt="KEY tab" width="410"></p>
+<p align="center"><img src="docs/img/nyashktune-presets.png" alt="Preset browser" width="410"> </p>
 
 ### Features
 
@@ -31,7 +31,6 @@ Realtime vocal pitch correction, from transparent, natural-sounding tuning to th
 | **Resynthesis** | PSOLA on pitch marks, mono/stereo |
 | **Scales** | 16 scales + **Custom** (click notes C…B), key, Ref A4 (415–466 Hz) |
 | **Per-note BYPASS** | Right-click a note: it is allowed as a target but sung exactly as it is (blue-note / slide friendly) |
-| **Scale Learn** | KEY tab: start learning, sing, **SET KEY + SCALE** (major/minor) or **MAKE CUSTOM SCALE** from the notes you sang |
 | **Character** | Retune Speed (0 = hard T-Pain), Note Transition, **LINK**, Amount, Flex-Tune, Humanize, Natural Vibrato, **Tracking** (how reluctantly it jumps to another note) |
 | **Vibrato** | Synthetic vibrato: Depth / Rate / Delay, shapes Sine / Triangle / Saw / Wander |
 | **MIDI Target** | Tunes to the notes you play on a MIDI keyboard |
@@ -42,13 +41,6 @@ Realtime vocal pitch correction, from transparent, natural-sounding tuning to th
 | **Your presets** | **SAVE** stores every setting under your own name and category (any language / symbols) in the preset browser. Files: `~/.config/NyashkTune/presets` (Linux), `%APPDATA%\\NyashkTune\\presets` (Windows), `~/Library/Application Support/NyashkTune/presets` (macOS) - copy them to share |
 | **Switch off what you don't need** | the module switches on the tab bar - **FORMANT**, **VOICES** (master) and each voice **ON**, **COLOUR** (Air/Drive), **VIBRATO**: when off the stage is skipped completely (no CPU) - plain pitch correction only needs the TUNE tab |
 | **Other** | 28 presets (incl. **Anime Vocal**), full automation, state recall, resizable window |
-
-### Scale Learn (KEY tab)
-
-Off by default - it only counts while you press **START LEARNING** (so it costs nothing and never gets in the way). While it is on, the plugin counts how long each of the 12 notes was heard of your raw, uncorrected voice (the bars; white = notes you really use).
-- **SET KEY + SCALE** compares the histogram with typical major / minor profiles and sets KEY + SCALE ("you sing in: A minor (87%)"; needs a few seconds of singing).
-- **MAKE CUSTOM SCALE** builds a **Custom** scale from exactly the notes you sang (below 12 % of the most used note are ignored).
-- **CLEAR** starts over. Both buttons switch learning off when they are done.
 
 ### Preset browser
 

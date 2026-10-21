@@ -3,7 +3,7 @@
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 pub mod engine;
@@ -451,11 +451,6 @@ pub struct Meters {
     pub hz: AtomicF32,
     pub target: AtomicF32,
     pub corr: AtomicF32,
-    /// how long each pitch class (of the sung, uncorrected pitch) has been heard - for KEY DETECT / LEARN
-    pub hist: [AtomicU32; 12],
-    pub hist_reset: AtomicBool,
-    /// the pitch-class histogram only counts while this is on (KEY tab)
-    pub learn_on: AtomicBool,
 }
 
 impl Default for Meters {
@@ -465,9 +460,6 @@ impl Default for Meters {
             hz: AtomicF32::new(0.0),
             target: AtomicF32::new(0.0),
             corr: AtomicF32::new(0.0),
-            hist: std::array::from_fn(|_| AtomicU32::new(0)),
-            hist_reset: AtomicBool::new(false),
-            learn_on: AtomicBool::new(false),
         }
     }
 }
@@ -605,18 +597,6 @@ impl Plugin for NyashkTune {
         self.meters.hz.store(m.hz, Ordering::Relaxed);
         self.meters.target.store(m.target, Ordering::Relaxed);
         self.meters.corr.store(m.corr, Ordering::Relaxed);
-        if self.meters.hist_reset.swap(false, Ordering::Relaxed) {
-            for h in self.meters.hist.iter() {
-                h.store(0, Ordering::Relaxed);
-            }
-        }
-        if self.meters.learn_on.load(Ordering::Relaxed) && m.voiced && m.hz > 20.0 && !ep.bypass {
-            let midi = 69.0 + 12.0 * (m.hz as f64 / ep.ref_a as f64).log2();
-            let pc = (midi.round() as i64).rem_euclid(12) as usize;
-            let w = (buffer.samples() as u32 / 16).max(1);
-            let h = &self.meters.hist[pc];
-            h.store(h.load(Ordering::Relaxed).saturating_add(w), Ordering::Relaxed);
-        }
 
         ProcessStatus::Normal
     }

@@ -1117,58 +1117,6 @@ impl Engine {
     }
 }
 
-// ------------------------------------------------------------------------------------------
-// Key detection (Krumhansl-Kessler profiles) and scale learning from a pitch-class histogram
-// ------------------------------------------------------------------------------------------
-
-/// Returns (key 0..11 with 0 = C, scale index into SCALE_NAMES (Major = 1, Natural Minor = 2), correlation).
-pub fn detect_key(hist: &[f32; 12]) -> Option<(usize, usize, f32)> {
-    const MAJ: [f32; 12] = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
-    const MIN: [f32; 12] = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
-    let total: f32 = hist.iter().sum();
-    if total <= 0.0 {
-        return None;
-    }
-    let mean_h = total / 12.0;
-    let corr = |prof: &[f32; 12], key: usize| -> f32 {
-        let mp: f32 = prof.iter().sum::<f32>() / 12.0;
-        let (mut num, mut dh, mut dp) = (0.0, 0.0, 0.0);
-        for i in 0..12 {
-            let a = hist[(key + i) % 12] - mean_h;
-            let b = prof[i] - mp;
-            num += a * b;
-            dh += a * a;
-            dp += b * b;
-        }
-        num / (dh.sqrt() * dp.sqrt() + 1e-12)
-    };
-    let mut best = (0usize, 1usize, f32::MIN);
-    for key in 0..12 {
-        for (sc, prof) in [(1usize, &MAJ), (2usize, &MIN)] {
-            let c = corr(prof, key);
-            if c > best.2 {
-                best = (key, sc, c);
-            }
-        }
-    }
-    Some(best)
-}
-
-/// Pitch classes that were sung noticeably often (at least `frac` of the most frequent one).
-pub fn learn_mask(hist: &[f32; 12], frac: f32) -> u16 {
-    let mx = hist.iter().cloned().fold(0.0f32, f32::max);
-    if mx <= 0.0 {
-        return 0xFFF;
-    }
-    let mut m = 0u16;
-    for (i, h) in hist.iter().enumerate() {
-        if *h >= mx * frac {
-            m |= 1 << i;
-        }
-    }
-    m
-}
-
 #[cfg(test)]
 mod fuzz_tests {
     use super::*;
@@ -1304,25 +1252,5 @@ mod fuzz_tests {
         let base = run(false);
         let tog = run(true);
         assert!(tog < 3.0 * base + 0.05, "toggle jump {tog} vs plain {base}");
-    }
-
-    #[test]
-    fn key_detection_and_learning() {
-        // C major scale usage
-        let mut h = [0.0f32; 12];
-        for (pc, w) in [(0, 10.0), (2, 6.0), (4, 8.0), (5, 5.0), (7, 9.0), (9, 6.0), (11, 4.0)] {
-            h[pc] = w * 100.0;
-        }
-        let (k, sc, c) = detect_key(&h).unwrap();
-        assert_eq!((k, sc), (0, 1), "corr {c}");
-        // same shifted to A minor-ish emphasis
-        let mut m = [0.0f32; 12];
-        for (pc, w) in [(9, 10.0), (11, 5.0), (0, 8.0), (2, 6.0), (4, 9.0), (5, 5.0), (7, 4.0)] {
-            m[pc] = w * 100.0;
-        }
-        let (k, sc, _) = detect_key(&m).unwrap();
-        assert_eq!((k, sc), (9, 2));
-        assert_eq!(learn_mask(&h, 0.12), 0b1010_1011_0101);
-        assert!(detect_key(&[0.0; 12]).is_none());
     }
 }
