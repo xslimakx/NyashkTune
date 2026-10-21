@@ -10,16 +10,17 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::browse::{self, BAct, BItem, BState};
 use crate::{engine, FormantAlgo, Key, Meters, NyashkTuneParams, ScaleKind, VibShape, VoiceRange};
 
 // palette
-const BG: Color32 = Color32::from_rgb(0x0a, 0x0a, 0x0a);
-const PANEL: Color32 = Color32::from_rgb(0x11, 0x11, 0x11);
-const PANEL2: Color32 = Color32::from_rgb(0x1c, 0x1c, 0x1c);
-const LINE: Color32 = Color32::from_rgb(0x2e, 0x2e, 0x2e);
-const WHITE: Color32 = Color32::from_rgb(0xf2, 0xf2, 0xf2);
-const DIM: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
-const MID: Color32 = Color32::from_rgb(0x7a, 0x7a, 0x7a);
+pub(crate) const BG: Color32 = Color32::from_rgb(0x0a, 0x0a, 0x0a);
+pub(crate) const PANEL: Color32 = Color32::from_rgb(0x11, 0x11, 0x11);
+pub(crate) const PANEL2: Color32 = Color32::from_rgb(0x1c, 0x1c, 0x1c);
+pub(crate) const LINE: Color32 = Color32::from_rgb(0x2e, 0x2e, 0x2e);
+pub(crate) const WHITE: Color32 = Color32::from_rgb(0xf2, 0xf2, 0xf2);
+pub(crate) const DIM: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
+pub(crate) const MID: Color32 = Color32::from_rgb(0x7a, 0x7a, 0x7a);
 
 const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const HIST: usize = 220;
@@ -57,6 +58,11 @@ pub const PRESETS: [&str; 28] = [
     "Formant Lab (LPC +3)",
 ];
 
+const PRESET_CATS: [&str; 28] = [
+    "Natural", "Natural", "Natural", "Natural", "Hard Tune", "Hard Tune", "Hard Tune", "Robot / FX", "Gender", "Gender", "Vibrato", "MIDI",
+    "Anime", "Anime", "Anime", "Anime", "Gender", "Gender", "Choir / Harmony", "Choir / Harmony", "Choir / Harmony", "Choir / Harmony", "Choir / Harmony", "Robot / FX", "Vibrato", "Robot / FX", "Gender", "Robot / FX",
+];
+
 struct Gui {
     det: VecDeque<f32>,
     cor: VecDeque<f32>,
@@ -66,9 +72,15 @@ struct Gui {
     last_target: f32,
     voiced: bool,
     tab: usize,
-    user: Vec<String>,
+    user: Vec<(String, String)>, // (name, category)
     user_sel: Option<String>,
-    save_name: Option<String>,
+    save_name: String,
+    save_cat: String,
+    browser: bool,
+    bs: BState,
+    meta: std::collections::HashMap<String, (bool, u8)>, // favourite, rating
+    last_scan: f64,
+    msg: String,
 }
 
 fn midi_name(m: i32) -> String {
@@ -79,7 +91,7 @@ fn is_black(pc: usize) -> bool {
     matches!(pc, 1 | 3 | 6 | 8 | 10)
 }
 
-fn mono(size: f32) -> FontId {
+pub(crate) fn mono(size: f32) -> FontId {
     FontId::monospace(size)
 }
 
@@ -428,32 +440,70 @@ fn clean_preset_name(n: &str) -> String {
     n.trim().chars().filter(|c| !c.is_control() && !"/\\:*?\"<>|".contains(*c)).collect::<String>().trim().to_string()
 }
 
-fn list_user_presets() -> Vec<String> {
-    let mut v: Vec<String> = Vec::new();
+fn list_user_presets() -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = Vec::new();
     if let Some(d) = preset_dir() {
         if let Ok(rd) = std::fs::read_dir(d) {
             for e in rd.flatten() {
                 let path = e.path();
                 if path.extension().and_then(|x| x.to_str()) == Some("nytune") {
                     if let Some(n) = path.file_stem().and_then(|x| x.to_str()) {
-                        v.push(n.to_string());
+                        let cat = std::fs::read_to_string(&path)
+                            .ok()
+                            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("@cat=").map(|c| c.trim().to_string())))
+                            .filter(|c| !c.is_empty())
+                            .unwrap_or_else(|| "User".to_string());
+                        v.push((n.to_string(), cat));
                     }
                 }
             }
         }
     }
-    v.sort_by_key(|a| a.to_lowercase());
+    v.sort_by_key(|a| a.0.to_lowercase());
     v
 }
 
-fn save_user_preset(p: &NyashkTuneParams, name: &str) -> std::io::Result<String> {
+fn meta_path() -> Option<std::path::PathBuf> {
+    preset_dir().and_then(|d| d.parent().map(|p| p.join("favorites.txt")))
+}
+
+fn load_meta() -> std::collections::HashMap<String, (bool, u8)> {
+    let mut m = std::collections::HashMap::new();
+    if let Some(t) = meta_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        for l in t.lines() {
+            let f: Vec<&str> = l.split('\t').collect();
+            if f.len() == 3 {
+                m.insert(f[0].to_string(), (f[1] == "1", f[2].parse().unwrap_or(0)));
+            }
+        }
+    }
+    m
+}
+
+fn save_meta(m: &std::collections::HashMap<String, (bool, u8)>) {
+    if let Some(p) = meta_path() {
+        let _ = std::fs::create_dir_all(p.parent().unwrap_or(std::path::Path::new(".")));
+        let mut out = String::new();
+        for (k, (f, r)) in m {
+            if *f || *r > 0 {
+                out.push_str(&format!("{k}\t{}\t{r}\n", *f as u8));
+            }
+        }
+        let _ = std::fs::write(p, out);
+    }
+}
+
+fn save_user_preset(p: &NyashkTuneParams, name: &str, cat: &str) -> std::io::Result<String> {
     let name = clean_preset_name(name);
     if name.is_empty() {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty name"));
     }
+    let cat = clean_preset_name(cat);
+    let cat = if cat.is_empty() { "User".to_string() } else { cat };
     let dir = preset_dir().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no config folder"))?;
     std::fs::create_dir_all(&dir)?;
     let mut out = String::from("NyashkTune preset v1\n");
+    out.push_str(&format!("@cat={cat}\n"));
     for (id, ptr, _) in p.param_map() {
         if id == "bypass" {
             continue;
@@ -694,7 +744,7 @@ fn painter_label(ui: &Ui, cell: Rect, vr: Rect, label: &str) {
     ui.painter().text(Pos2::new(cell.center().x, vr.bottom() + 9.0), Align2::CENTER_CENTER, label, mono(10.0), DIM);
 }
 
-fn pill(ui: &mut Ui, rect: Rect, text: &str, on: bool) -> bool {
+pub(crate) fn pill(ui: &mut Ui, rect: Rect, text: &str, on: bool) -> bool {
     let resp = ui.allocate_rect(rect, Sense::click());
     let painter = ui.painter();
     let hov = resp.hovered();
@@ -745,7 +795,13 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
         tab: 0,
         user: list_user_presets(),
         user_sel: None,
-        save_name: None,
+        save_name: String::new(),
+        save_cat: String::new(),
+        browser: false,
+        bs: BState::default(),
+        meta: load_meta(),
+        last_scan: 0.0,
+        msg: String::new(),
     };
     let editor_state = params.editor_state.clone();
     let size_state = editor_state.clone();
@@ -817,6 +873,93 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 let rect = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(Pos2::new(o.x + x, o.y + y), Vec2::new(w, h));
                 let painter = ui.painter().clone();
 
+                // ---- preset browser (modal)
+                if st.browser {
+                    let now = ui.input(|i| i.time);
+                    if now - st.last_scan > 2.5 {
+                        st.user = list_user_presets();
+                        st.last_scan = now;
+                    }
+                    let n_fac = PRESETS.len();
+                    let items: Vec<BItem> = PRESETS
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| {
+                            let (fav, rating) = st.meta.get(&format!("f:{n}")).copied().unwrap_or((false, 0));
+                            BItem { name: n.to_string(), cat: PRESET_CATS[i].to_string(), fav, user: false, rating }
+                        })
+                        .chain(st.user.iter().map(|(n, c)| {
+                            let (fav, rating) = st.meta.get(&format!("u:{n}")).copied().unwrap_or((false, 0));
+                            BItem { name: n.clone(), cat: c.clone(), fav, user: true, rating }
+                        }))
+                        .collect();
+                    let cur_raw = p.preset.load(Ordering::Relaxed) as usize;
+                    let sel: Option<usize> = if cur_raw < n_fac { Some(cur_raw) } else { st.user_sel.as_ref().and_then(|n| st.user.iter().position(|(u, _)| u == n)).map(|i| n_fac + i) };
+                    let area = rect(8.0, 8.0, 884.0, 654.0);
+                    let act = browse::browser(ui, area, "PRESETS", &items, sel, &mut st.bs);
+                    let key_of = |i: usize| if i < n_fac { format!("f:{}", PRESETS[i]) } else { format!("u:{}", items[i].name) };
+                    match act {
+                        BAct::Pick(i) => {
+                            if i < n_fac {
+                                apply_preset(setter, p, i);
+                                st.user_sel = None;
+                            } else if load_user_preset(setter, p, &items[i].name) {
+                                p.preset.store(u32::MAX, Ordering::Relaxed);
+                                st.user_sel = Some(items[i].name.clone());
+                                st.save_name = items[i].name.clone();
+                                st.save_cat = items[i].cat.clone();
+                            }
+                        }
+                        BAct::Fav(i) => {
+                            let e = st.meta.entry(key_of(i)).or_insert((false, 0));
+                            e.0 = !e.0;
+                            save_meta(&st.meta);
+                        }
+                        BAct::Rate(i, v) => {
+                            let e = st.meta.entry(key_of(i)).or_insert((false, 0));
+                            e.1 = v;
+                            save_meta(&st.meta);
+                        }
+                        BAct::Close => st.browser = false,
+                        BAct::None => {}
+                    }
+                    // footer: save as / category / save / delete
+                    let f = browse::footer(area);
+                    let y = f.top() + 4.0;
+                    painter.text(Pos2::new(f.left(), y + 12.0), Align2::LEFT_CENTER, "SAVE AS", mono(10.0), DIM);
+                    let nr = Rect::from_min_size(Pos2::new(f.left() + 62.0, y), Vec2::new(250.0, 24.0));
+                    ui.put(nr, egui::TextEdit::singleline(&mut st.save_name).font(mono(12.0)).hint_text("preset name").desired_width(nr.width()).margin(egui::Margin::symmetric(6, 4)));
+                    painter.text(Pos2::new(nr.right() + 14.0, y + 12.0), Align2::LEFT_CENTER, "CATEGORY", mono(10.0), DIM);
+                    let cr = Rect::from_min_size(Pos2::new(nr.right() + 84.0, y), Vec2::new(170.0, 24.0));
+                    ui.put(cr, egui::TextEdit::singleline(&mut st.save_cat).font(mono(12.0)).hint_text("Vocal, Fun, Mine...").desired_width(cr.width()).margin(egui::Margin::symmetric(6, 4)));
+                    if pill(ui, Rect::from_min_size(Pos2::new(cr.right() + 10.0, y), Vec2::new(70.0, 24.0)), "SAVE", true) {
+                        match save_user_preset(p, &st.save_name, &st.save_cat) {
+                            Ok(n) => {
+                                st.user = list_user_presets();
+                                st.user_sel = Some(n.clone());
+                                p.preset.store(u32::MAX, Ordering::Relaxed);
+                                st.msg = format!("saved \"{n}\"");
+                            }
+                            Err(e) => st.msg = format!("not saved: {e}"),
+                        }
+                    }
+                    if let Some(n) = st.user_sel.clone().filter(|_| cur_raw >= n_fac) {
+                        if pill(ui, Rect::from_min_size(Pos2::new(cr.right() + 88.0, y), Vec2::new(70.0, 24.0)), "DELETE", false) {
+                            delete_user_preset(&n);
+                            st.user = list_user_presets();
+                            st.user_sel = None;
+                            st.msg = format!("deleted \"{n}\"");
+                        }
+                    }
+                    if !st.msg.is_empty() {
+                        painter.text(Pos2::new(f.left(), y + 40.0), Align2::LEFT_CENTER, &st.msg, mono(10.0), MID);
+                    }
+                    if let Some(d) = preset_dir() {
+                        painter.text(Pos2::new(f.right(), y + 40.0), Align2::RIGHT_CENTER, d.display().to_string(), mono(9.0), DIM);
+                    }
+                    return;
+                }
+
                 // ---- header
                 let time = ui.input(|i| i.time);
                 painter.text(Pos2::new(o.x + 18.0, o.y + 34.0), Align2::LEFT_CENTER, "Nyashk", mono(19.0), WHITE);
@@ -827,39 +970,55 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 painter.hline(o.x + 14.0..=o.x + 886.0, o.y + 58.0, Stroke::new(1.0_f32, LINE));
 
                 // preset
+                // preset selector: < name (opens the browser) > SAVE
+                let n_fac = PRESETS.len();
+                let n_all = n_fac + st.user.len();
                 let cur_raw = p.preset.load(Ordering::Relaxed) as usize;
-                let cur_label = if cur_raw < PRESETS.len() {
-                    PRESETS[cur_raw].to_string()
+                let cur_idx: Option<usize> = if cur_raw < n_fac {
+                    Some(cur_raw)
                 } else {
-                    st.user_sel.clone().map(|n| format!("* {n}")).unwrap_or_else(|| "User preset".to_string())
+                    st.user_sel.as_ref().and_then(|n| st.user.iter().position(|(u, _)| u == n)).map(|i| n_fac + i)
                 };
-                ui.allocate_new_ui(UiBuilder::new().max_rect(rect(158.0, 17.0, 164.0, 28.0)), |ui| {
-                    egui::ComboBox::from_id_salt("preset")
-                        .width(142.0)
-                        .selected_text(egui::RichText::new(cur_label).font(mono(12.0)))
-                        .show_ui(ui, |ui| {
-                            for (i, n) in PRESETS.iter().enumerate() {
-                                if ui.selectable_label(i == cur_raw, egui::RichText::new(*n).font(mono(12.0))).clicked() {
-                                    apply_preset(setter, p, i);
-                                    st.user_sel = None;
-                                }
-                            }
-                            if !st.user.is_empty() {
-                                ui.separator();
-                                for n in st.user.clone() {
-                                    let sel = cur_raw >= PRESETS.len() && st.user_sel.as_deref() == Some(n.as_str());
-                                    if ui.selectable_label(sel, egui::RichText::new(format!("* {n}")).font(mono(12.0))).clicked() && load_user_preset(setter, p, &n) {
-                                        p.preset.store(u32::MAX, Ordering::Relaxed);
-                                        st.user_sel = Some(n);
-                                    }
-                                }
-                            }
-                        });
-                });
-                painter.text(Pos2::new(o.x + 336.0, o.y + 31.0), Align2::LEFT_CENTER, "KEY", mono(10.0), DIM);
-                enum_combo(ui, setter, &p.key, "key", rect(366.0, 17.0, 66.0, 28.0));
-                painter.text(Pos2::new(o.x + 440.0, o.y + 31.0), Align2::LEFT_CENTER, "SCALE", mono(10.0), DIM);
-                enum_combo(ui, setter, &p.scale, "scale", rect(484.0, 17.0, 136.0, 28.0));
+                let name: String = match cur_idx {
+                    Some(i) if i < n_fac => PRESETS[i].to_string(),
+                    Some(i) => st.user[i - n_fac].0.clone(),
+                    None => "- preset -".to_string(),
+                };
+                let name: String = if name.chars().count() > 14 { name.chars().take(13).collect::<String>() + "~" } else { name };
+                let mut pick: Option<usize> = None;
+                if pill(ui, rect(150.0, 17.0, 24.0, 28.0), "<", false) {
+                    pick = Some(cur_idx.map(|i| (i + n_all - 1) % n_all).unwrap_or(0));
+                }
+                if pill(ui, rect(178.0, 17.0, 114.0, 28.0), &name, false) {
+                    st.browser = true;
+                    st.user = list_user_presets();
+                    st.save_name = st.user_sel.clone().unwrap_or_default();
+                    st.msg.clear();
+                }
+                if pill(ui, rect(296.0, 17.0, 24.0, 28.0), ">", false) {
+                    pick = Some(cur_idx.map(|i| (i + 1) % n_all).unwrap_or(0));
+                }
+                if pill(ui, rect(324.0, 17.0, 44.0, 28.0), "SAVE", false) {
+                    st.browser = true;
+                    st.user = list_user_presets();
+                    st.save_name = st.user_sel.clone().unwrap_or_default();
+                    st.msg.clear();
+                }
+                if let Some(i) = pick {
+                    if i < n_fac {
+                        apply_preset(setter, p, i);
+                        st.user_sel = None;
+                    } else if let Some((n, _)) = st.user.get(i - n_fac).cloned() {
+                        if load_user_preset(setter, p, &n) {
+                            p.preset.store(u32::MAX, Ordering::Relaxed);
+                            st.user_sel = Some(n);
+                        }
+                    }
+                }
+                painter.text(Pos2::new(o.x + 376.0, o.y + 31.0), Align2::LEFT_CENTER, "KEY", mono(10.0), DIM);
+                enum_combo(ui, setter, &p.key, "key", rect(402.0, 17.0, 60.0, 28.0));
+                painter.text(Pos2::new(o.x + 468.0, o.y + 31.0), Align2::LEFT_CENTER, "SCALE", mono(10.0), DIM);
+                enum_combo(ui, setter, &p.scale, "scale", rect(510.0, 17.0, 116.0, 28.0));
                 if pill(ui, rect(634.0, 18.0, 68.0, 26.0), "BYPASS", p.bypass.value()) {
                     set_b(setter, &p.bypass, !p.bypass.value());
                 }
@@ -949,54 +1108,22 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 }
 
                 // ---- tabs
-                for (i, t) in ["TUNE", "FORMANT", "VOICES"].iter().enumerate() {
-                    if pill(ui, rect(14.0 + i as f32 * 118.0, 304.0, 110.0, 26.0), t, st.tab == i) {
+                let learning = meters.learn_on.load(Ordering::Relaxed);
+                for (i, t) in ["TUNE", "FORMANT", "VOICES", if learning { "KEY \u{25CF}" } else { "KEY" }].iter().enumerate() {
+                    if pill(ui, rect(14.0 + i as f32 * 100.0, 304.0, 96.0, 26.0), t, st.tab == i) {
                         st.tab = i;
                     }
                 }
-                if let Some(mut buf) = st.save_name.clone() {
-                    let te = egui::TextEdit::singleline(&mut buf).font(mono(11.0)).desired_width(160.0).margin(egui::Margin::symmetric(6, 4));
-                    let r_te = ui.put(rect(384.0, 304.0, 172.0, 26.0), te);
-                    if !r_te.has_focus() && !r_te.lost_focus() {
-                        r_te.request_focus();
-                    }
-                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                    let ok = pill(ui, rect(562.0, 304.0, 40.0, 26.0), "OK", false) || enter;
-                    let cancel = pill(ui, rect(606.0, 304.0, 28.0, 26.0), "X", false) || esc;
-                    if ok {
-                        if let Ok(n) = save_user_preset(p, &buf) {
-                            st.user = list_user_presets();
-                            st.user_sel = Some(n);
-                            p.preset.store(u32::MAX, Ordering::Relaxed);
-                        }
-                        st.save_name = None;
-                    } else if cancel {
-                        st.save_name = None;
-                    } else {
-                        st.save_name = Some(buf);
-                    }
-                } else {
-                    if pill(ui, rect(384.0, 304.0, 104.0, 26.0), "SAVE PRESET", false) {
-                        st.save_name = Some(st.user_sel.clone().unwrap_or_else(|| "My preset".to_string()));
-                    }
-                    if st.user_sel.is_some() && p.preset.load(Ordering::Relaxed) as usize >= PRESETS.len() && pill(ui, rect(494.0, 304.0, 70.0, 26.0), "DELETE", false) {
-                        if let Some(n) = st.user_sel.take() {
-                            delete_user_preset(&n);
-                            st.user = list_user_presets();
-                        }
-                    }
-                    // module switches: whatever is off is not computed at all
-                    painter.text(Pos2::new(o.x + 598.0 - 8.0, o.y + 317.0), Align2::RIGHT_CENTER, "modules", mono(9.5), DIM);
-                    let mods: [(&str, bool); 4] = [("FORMANT", p.formant_on.value()), ("VOICES", p.voices_on.value()), ("COLOUR", p.colour_on.value()), ("VIBRATO", p.vib_on.value())];
-                    for (i, (t, on)) in mods.iter().enumerate() {
-                        if pill(ui, rect(598.0 + 72.0 * i as f32, 304.0, 68.0, 26.0), t, *on) {
-                            match i {
-                                0 => set_b(setter, &p.formant_on, !on),
-                                1 => set_b(setter, &p.voices_on, !on),
-                                2 => set_b(setter, &p.colour_on, !on),
-                                _ => set_b(setter, &p.vib_on, !on),
-                            }
+                // module switches: whatever is off is not computed at all
+                painter.text(Pos2::new(o.x + 598.0 - 8.0, o.y + 317.0), Align2::RIGHT_CENTER, "modules", mono(9.5), DIM);
+                let mods: [(&str, bool); 4] = [("FORMANT", p.formant_on.value()), ("VOICES", p.voices_on.value()), ("COLOUR", p.colour_on.value()), ("VIBRATO", p.vib_on.value())];
+                for (i, (t, on)) in mods.iter().enumerate() {
+                    if pill(ui, rect(598.0 + 72.0 * i as f32, 304.0, 68.0, 26.0), t, *on) {
+                        match i {
+                            0 => set_b(setter, &p.formant_on, !on),
+                            1 => set_b(setter, &p.voices_on, !on),
+                            2 => set_b(setter, &p.colour_on, !on),
+                            _ => set_b(setter, &p.vib_on, !on),
                         }
                     }
                 }
@@ -1055,7 +1182,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     knob(ui, setter, &p.gate, "Gate", c[1], "Below this level the signal passes through untuned.", false);
                     knob(ui, setter, &p.ref_a, "Ref A4", c[2], "", false);
 
-                    let g3 = group(ui, 14.0, row2, 324.0, "03", "VIBRATO");
+                    let g3 = group(ui, 14.0, row2, 430.0, "03", "VIBRATO");
                     let c = cells(g3, 3);
                     knob(ui, setter, &p.vib_depth, "Depth", c[0], "", false);
                     knob(ui, setter, &p.vib_rate, "Rate", c[1], "", false);
@@ -1065,48 +1192,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                         set_b(setter, &p.vib_on, !p.vib_on.value());
                     }
 
-                    // ---- scale learn: what pitch classes were sung, key detection
-                    let g4 = group(ui, 348.0, row2, 270.0, "04", "SCALE LEARN");
-                    let hist: [f32; 12] = std::array::from_fn(|i| meters.hist[i].load(Ordering::Relaxed) as f32);
-                    let total: f32 = hist.iter().sum();
-                    let mx = hist.iter().cloned().fold(0.0f32, f32::max).max(1.0);
-                    let bars = Rect::from_min_size(Pos2::new(g4.left() + 12.0, g4.top() + 30.0), Vec2::new(g4.width() - 24.0, 48.0));
-                    let bw = bars.width() / 12.0;
-                    for i in 0..12 {
-                        let h = hist[i] / mx * (bars.height() - 13.0);
-                        let x0 = bars.left() + bw * i as f32;
-                        let br = Rect::from_min_max(Pos2::new(x0 + 2.0, bars.bottom() - 13.0 - h), Pos2::new(x0 + bw - 2.0, bars.bottom() - 13.0));
-                        if h > 0.5 {
-                            painter.rect_filled(br, CornerRadius::same(2), if hist[i] >= mx * 0.12 { WHITE } else { MID });
-                        }
-                        painter.hline(x0 + 2.0..=x0 + bw - 2.0, bars.bottom() - 13.0, Stroke::new(1.0_f32, LINE));
-                        painter.text(Pos2::new(x0 + bw * 0.5, bars.bottom() - 5.0), Align2::CENTER_CENTER, NOTE_NAMES[i], mono(8.0), if is_black(i) { DIM } else { WHITE });
-                    }
-                    let det = if total > 3000.0 { engine::detect_key(&hist) } else { None };
-                    let txt = match det {
-                        Some((k, sc, c)) => format!("sung in: {} {}  ({:.0}%)", NOTE_NAMES[k], if sc == 1 { "major" } else { "minor" }, (c * 100.0).max(0.0)),
-                        None => "sing a phrase to learn...".to_string(),
-                    };
-                    painter.text(Pos2::new(g4.left() + 12.0, g4.top() + 92.0), Align2::LEFT_CENTER, txt, mono(10.5), if det.is_some() { WHITE } else { DIM });
-                    let py = g4.top() + 108.0;
-                    if pill(ui, Rect::from_min_size(Pos2::new(g4.left() + 12.0, py), Vec2::new(78.0, 26.0)), "DETECT", false) {
-                        if let Some((k, sc, _)) = det {
-                            set_e(setter, &p.key, Key::from_index(k));
-                            set_e(setter, &p.scale, if sc == 1 { ScaleKind::Major } else { ScaleKind::NaturalMinor });
-                        }
-                    }
-                    if pill(ui, Rect::from_min_size(Pos2::new(g4.left() + 96.0, py), Vec2::new(78.0, 26.0)), "LEARN", false) && total > 3000.0 {
-                        let m = engine::learn_mask(&hist, 0.12);
-                        for (i, n) in p.notes.iter().enumerate() {
-                            set_b(setter, &n.on, (m >> i) & 1 == 1);
-                        }
-                        set_e(setter, &p.scale, ScaleKind::Custom);
-                    }
-                    if pill(ui, Rect::from_min_size(Pos2::new(g4.left() + 180.0, py), Vec2::new(78.0, 26.0)), "CLEAR", false) {
-                        meters.hist_reset.store(true, Ordering::Relaxed);
-                    }
-
-                    let g5 = group(ui, 628.0, row2, 258.0, "05", "OUTPUT");
+                    let g5 = group(ui, 454.0, row2, 432.0, "04", "OUTPUT");
                     let c = cells(g5, 3);
                     knob(ui, setter, &p.mix, "Mix", c[0], "", false);
                     knob(ui, setter, &p.in_gain, "Input", c[1], "", true);
@@ -1180,7 +1266,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                         painter.text(Pos2::new(g4.left() + 14.0, g4.top() + 72.0 + 17.0 * i as f32), Align2::LEFT_CENTER, *l, mono(10.5), MID);
                     }
                     painter.text(Pos2::new(g4.left() + 14.0, g4.bottom() - 18.0), Align2::LEFT_CENTER, "Tip: KEEP FORMANTS on = formants stay where you set them.", mono(9.5), DIM);
-                } else {
+                } else if st.tab == 2 {
                     for i in 0..2 {
                         let y = if i == 0 { row1 } else { row2 };
                         let g = group(ui, 14.0, y, 872.0, if i == 0 { "01" } else { "02" }, if i == 0 { "VOICE 1" } else { "VOICE 2" });
@@ -1205,6 +1291,55 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                         knob_id(ui, setter, &v.detune, "Detune", &format!("v{n}_det"), c[3], "Fine pitch offset: a few cents gives a chorus / double-tracked feel.", true);
                         knob_id(ui, setter, &v.formant, "Formant", &format!("v{n}_fmt"), c[4], "Extra formant shift for this voice only.", true);
                         knob_id(ui, setter, &v.delay, "Delay", &format!("v{n}_dly"), c[5], "Small delay (10-30 ms) makes it a separate 'person'.", false);
+                    }
+                } else {
+                    // ---- KEY: learn which notes you sing, find the key / build a scale. Only counts while LEARNING is on.
+                    let g = group(ui, 14.0, row1, 872.0, "01", "NOTES YOU SING");
+                    let hist: [f32; 12] = std::array::from_fn(|i| meters.hist[i].load(Ordering::Relaxed) as f32);
+                    let total: f32 = hist.iter().sum();
+                    let mx = hist.iter().cloned().fold(0.0f32, f32::max).max(1.0);
+                    let bars = Rect::from_min_size(Pos2::new(g.left() + 16.0, g.top() + 34.0), Vec2::new(g.width() - 32.0, g.height() - 44.0));
+                    let bw = bars.width() / 12.0;
+                    for i in 0..12 {
+                        let h = hist[i] / mx * (bars.height() - 18.0);
+                        let x0 = bars.left() + bw * i as f32;
+                        let base = bars.bottom() - 18.0;
+                        if h > 0.5 {
+                            painter.rect_filled(Rect::from_min_max(Pos2::new(x0 + 6.0, base - h), Pos2::new(x0 + bw - 6.0, base)), CornerRadius::same(3), if hist[i] >= mx * 0.12 { WHITE } else { MID });
+                        }
+                        painter.hline(x0 + 4.0..=x0 + bw - 4.0, base, Stroke::new(1.0_f32, LINE));
+                        painter.text(Pos2::new(x0 + bw * 0.5, bars.bottom() - 7.0), Align2::CENTER_CENTER, NOTE_NAMES[i], mono(10.0), if is_black(i) { DIM } else { WHITE });
+                    }
+                    let det = if total > 3000.0 { engine::detect_key(&hist) } else { None };
+                    let g2 = group(ui, 14.0, row2, 872.0, "02", "KEY DETECT / LEARN SCALE");
+                    let txt = match det {
+                        Some((k, sc, c)) => format!("you sing in:  {} {}   ({:.0}% match)", NOTE_NAMES[k], if sc == 1 { "major" } else { "minor" }, (c * 100.0).max(0.0)),
+                        None if learning => "listening... sing a phrase".to_string(),
+                        None => "press START and sing for a few seconds".to_string(),
+                    };
+                    painter.text(Pos2::new(g2.left() + 16.0, g2.top() + 46.0), Align2::LEFT_CENTER, txt, mono(14.0), if det.is_some() { WHITE } else { DIM });
+                    painter.text(Pos2::new(g2.left() + 16.0, g2.top() + 72.0), Align2::LEFT_CENTER, "Counting runs only while LEARNING is on (it uses no CPU otherwise). Turn it off when you are done.", mono(10.0), MID);
+                    let py = g2.top() + 100.0;
+                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 16.0, py), Vec2::new(130.0, 30.0)), if learning { "STOP LEARNING" } else { "START LEARNING" }, learning) {
+                        meters.learn_on.store(!learning, Ordering::Relaxed);
+                    }
+                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 156.0, py), Vec2::new(130.0, 30.0)), "SET KEY + SCALE", false) {
+                        if let Some((k, sc, _)) = det {
+                            set_e(setter, &p.key, Key::from_index(k));
+                            set_e(setter, &p.scale, if sc == 1 { ScaleKind::Major } else { ScaleKind::NaturalMinor });
+                            meters.learn_on.store(false, Ordering::Relaxed);
+                        }
+                    }
+                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 296.0, py), Vec2::new(150.0, 30.0)), "MAKE CUSTOM SCALE", false) && total > 3000.0 {
+                        let m = engine::learn_mask(&hist, 0.12);
+                        for (i, n) in p.notes.iter().enumerate() {
+                            set_b(setter, &n.on, (m >> i) & 1 == 1);
+                        }
+                        set_e(setter, &p.scale, ScaleKind::Custom);
+                        meters.learn_on.store(false, Ordering::Relaxed);
+                    }
+                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 456.0, py), Vec2::new(80.0, 30.0)), "CLEAR", false) {
+                        meters.hist_reset.store(true, Ordering::Relaxed);
                     }
                 }
 
@@ -1243,14 +1378,14 @@ mod tests {
         std::env::set_var("HOME", &dir);
         let p = NyashkTuneParams::default();
         assert_eq!(clean_preset_name("  a/b:c*d?\"e<f>g|h\\i  "), "abcdefghi");
-        assert!(save_user_preset(&p, "   ").is_err());
-        let n = save_user_preset(&p, "Мій пресет: ♥").unwrap();
+        assert!(save_user_preset(&p, "   ", "").is_err());
+        let n = save_user_preset(&p, "Мій пресет: ♥", "Мої").unwrap();
         assert_eq!(n, "Мій пресет ♥");
-        assert!(list_user_presets().contains(&n));
+        assert!(list_user_presets().contains(&(n.clone(), "Мої".to_string())));
         let text = std::fs::read_to_string(preset_dir().unwrap().join(format!("{n}.nytune"))).unwrap();
         assert!(text.contains("retune=") && text.contains("fmode=") && text.contains("@note_bypass=0") && !text.contains("\nbypass="));
         delete_user_preset(&n);
-        assert!(!list_user_presets().contains(&n));
+        assert!(!list_user_presets().iter().any(|(x, _)| *x == n));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
