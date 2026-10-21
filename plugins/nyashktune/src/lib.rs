@@ -3,10 +3,11 @@
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 pub mod engine;
+pub mod formant;
 mod editor;
 
 // ------------------------------------------------------------------------------------------
@@ -95,6 +96,41 @@ pub enum VoiceRange {
     Mezzo,
     #[name = "Soprano"]
     Soprano,
+    #[name = "Instrument"]
+    Instrument,
+}
+
+/// How the formants are shifted (see `formant.rs`).
+#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum FormantAlgo {
+    #[name = "Classic"]
+    Classic,
+    #[name = "Smooth"]
+    Smooth,
+    #[name = "Detailed"]
+    Detailed,
+    #[name = "Vocal (LPC)"]
+    Lpc,
+    #[name = "Bend"]
+    Bend,
+}
+
+impl FormantAlgo {
+    pub fn to_string_name(self) -> &'static str {
+        Self::variants()[self.to_index()]
+    }
+}
+
+#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum VibShape {
+    #[name = "Sine"]
+    Sine,
+    #[name = "Triangle"]
+    Triangle,
+    #[name = "Saw"]
+    Saw,
+    #[name = "Wander"]
+    Wander,
 }
 
 // ------------------------------------------------------------------------------------------
@@ -107,12 +143,54 @@ pub struct NoteParam {
     pub on: BoolParam,
 }
 
+/// One extra voice (harmony / double) sung next to the corrected lead.
+#[derive(Params)]
+pub struct VoiceParam {
+    #[id = "on"]
+    pub on: BoolParam,
+    #[id = "int"]
+    pub interval: FloatParam,
+    #[id = "snap"]
+    pub snap: BoolParam,
+    #[id = "lvl"]
+    pub level: FloatParam,
+    #[id = "pan"]
+    pub pan: FloatParam,
+    #[id = "det"]
+    pub detune: FloatParam,
+    #[id = "fmt"]
+    pub formant: FloatParam,
+    #[id = "dly"]
+    pub delay: FloatParam,
+}
+
+impl VoiceParam {
+    fn new(i: usize) -> Self {
+        let n = i + 1;
+        let defaults = [(4.0, -8.0, -60.0), (-5.0, -8.0, 60.0)];
+        let (iv, lv, pn) = defaults[i.min(1)];
+        Self {
+            on: BoolParam::new(format!("Voice {n} On"), false),
+            interval: FloatParam::new(format!("Voice {n} Interval"), iv, lin(-24.0, 24.0)).with_unit(" st").with_step_size(1.0),
+            snap: BoolParam::new(format!("Voice {n} Scale-Aware"), true),
+            level: FloatParam::new(format!("Voice {n} Level"), lv, lin(-30.0, 6.0)).with_unit(" dB").with_step_size(0.1),
+            pan: FloatParam::new(format!("Voice {n} Pan"), pn, lin(-100.0, 100.0)).with_unit(" %").with_step_size(1.0),
+            detune: FloatParam::new(format!("Voice {n} Detune"), 0.0, lin(-50.0, 50.0)).with_unit(" c").with_step_size(0.1),
+            formant: FloatParam::new(format!("Voice {n} Formant"), 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(0.1),
+            delay: FloatParam::new(format!("Voice {n} Delay"), 0.0, lin(0.0, 60.0)).with_unit(" ms").with_step_size(0.1),
+        }
+    }
+}
+
 #[derive(Params)]
 pub struct NyashkTuneParams {
     #[persist = "editor-state"]
     pub editor_state: Arc<EguiState>,
     #[persist = "preset"]
     pub preset: AtomicU32,
+    /// pitch classes flagged BYPASS (bit i = note i of the octave); not automatable
+    #[persist = "notebypass"]
+    pub note_bypass: AtomicU32,
 
     #[id = "bypass"]
     pub bypass: BoolParam,
@@ -148,6 +226,22 @@ pub struct NyashkTuneParams {
     pub formant: FloatParam,
     #[id = "keepformants"]
     pub keep_formants: BoolParam,
+    #[id = "fmode"]
+    pub fmode: EnumParam<FormantAlgo>,
+    #[id = "ftilt"]
+    pub ftilt: FloatParam,
+    #[id = "ffollow"]
+    pub ffollow: FloatParam,
+    #[id = "tracking"]
+    pub tracking: FloatParam,
+    #[id = "vibshape"]
+    pub vib_shape: EnumParam<VibShape>,
+    #[id = "air"]
+    pub air: FloatParam,
+    #[id = "drive"]
+    pub drive: FloatParam,
+    #[nested(array, group = "Voices")]
+    pub voices: [VoiceParam; 2],
 
     #[id = "viboon"]
     pub vib_on: BoolParam,
@@ -189,8 +283,9 @@ impl Default for NyashkTuneParams {
             on: BoolParam::new(format!("Custom Note {}", NOTE_NAMES[i]), true),
         });
         Self {
-            editor_state: EguiState::from_size(900, 640),
+            editor_state: EguiState::from_size(900, 670),
             preset: AtomicU32::new(0),
+            note_bypass: AtomicU32::new(0),
 
             bypass: BoolParam::new("Bypass", false).make_bypass(),
             key: EnumParam::new("Key", Key::C),
@@ -224,6 +319,14 @@ impl Default for NyashkTuneParams {
             fine: FloatParam::new("Detune", 0.0, lin(-100.0, 100.0)).with_unit(" c").with_step_size(0.1),
             formant: FloatParam::new("Formant Shift", 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(0.1),
             keep_formants: BoolParam::new("Keep Formants", true),
+            fmode: EnumParam::new("Formant Algorithm", FormantAlgo::Classic),
+            ftilt: FloatParam::new("Formant Tilt", 0.0, lin(-100.0, 100.0)).with_unit(" %").with_step_size(1.0),
+            ffollow: FloatParam::new("Formant Follow", 100.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
+            tracking: FloatParam::new("Tracking", 22.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
+            vib_shape: EnumParam::new("Vibrato Shape", VibShape::Sine),
+            air: FloatParam::new("Air", 0.0, lin(-6.0, 12.0)).with_unit(" dB").with_step_size(0.1),
+            drive: FloatParam::new("Drive", 0.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
+            voices: std::array::from_fn(VoiceParam::new),
 
             vib_on: BoolParam::new("Vibrato On", false),
             vib_depth: FloatParam::new("Vibrato Depth", 30.0, lin(0.0, 100.0)).with_unit(" c").with_step_size(0.1),
@@ -261,6 +364,7 @@ impl NyashkTuneParams {
             VoiceRange::Alto => (120.0, 760.0),     // ~B2 .. F#5
             VoiceRange::Mezzo => (140.0, 920.0),    // ~C#3 .. A#5
             VoiceRange::Soprano => (180.0, 1200.0), // ~F#3 .. D6
+            VoiceRange::Instrument => (60.0, 2000.0),
         }
     }
 
@@ -289,6 +393,27 @@ impl NyashkTuneParams {
             fine_cents: self.fine.value(),
             formant_semis: self.formant.value(),
             formant_preserve: self.keep_formants.value(),
+            formant_mode: formant::FormantMode::from_index(self.fmode.value() as usize),
+            formant_tilt: self.ftilt.value() / 100.0,
+            formant_follow: self.ffollow.value() / 100.0,
+            tracking: self.tracking.value() / 100.0,
+            bypass_mask: (self.note_bypass.load(Ordering::Relaxed) & 0xFFF) as u16,
+            vib_shape: self.vib_shape.value() as usize,
+            air_db: self.air.value(),
+            drive: self.drive.value() / 100.0,
+            voices: std::array::from_fn(|i| {
+                let v = &self.voices[i];
+                engine::VoiceParams {
+                    on: v.on.value(),
+                    interval: v.interval.value(),
+                    snap: v.snap.value(),
+                    level_db: v.level.value(),
+                    pan: v.pan.value() / 100.0,
+                    detune_cents: v.detune.value(),
+                    formant_semis: v.formant.value(),
+                    delay_ms: v.delay.value(),
+                }
+            }),
             vib_on: self.vib_on.value(),
             vib_depth_cents: self.vib_depth.value(),
             vib_rate_hz: self.vib_rate.value(),
@@ -313,6 +438,9 @@ pub struct Meters {
     pub hz: AtomicF32,
     pub target: AtomicF32,
     pub corr: AtomicF32,
+    /// how long each pitch class (of the sung, uncorrected pitch) has been heard - for KEY DETECT / LEARN
+    pub hist: [AtomicU32; 12],
+    pub hist_reset: AtomicBool,
 }
 
 impl Default for Meters {
@@ -322,6 +450,8 @@ impl Default for Meters {
             hz: AtomicF32::new(0.0),
             target: AtomicF32::new(0.0),
             corr: AtomicF32::new(0.0),
+            hist: std::array::from_fn(|_| AtomicU32::new(0)),
+            hist_reset: AtomicBool::new(false),
         }
     }
 }
@@ -351,7 +481,7 @@ impl Default for NyashkTune {
 impl Plugin for NyashkTune {
     const NAME: &'static str = "NyashkTune";
     const VENDOR: &'static str = "NyashkTune";
-    const URL: &'static str = "https://github.com/xslimakx/nyashk-plugins";
+    const URL: &'static str = "https://github.com/xslimakx/NyashkTune";
     const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
@@ -459,6 +589,18 @@ impl Plugin for NyashkTune {
         self.meters.hz.store(m.hz, Ordering::Relaxed);
         self.meters.target.store(m.target, Ordering::Relaxed);
         self.meters.corr.store(m.corr, Ordering::Relaxed);
+        if self.meters.hist_reset.swap(false, Ordering::Relaxed) {
+            for h in self.meters.hist.iter() {
+                h.store(0, Ordering::Relaxed);
+            }
+        }
+        if m.voiced && m.hz > 20.0 && !ep.bypass {
+            let midi = 69.0 + 12.0 * (m.hz as f64 / ep.ref_a as f64).log2();
+            let pc = (midi.round() as i64).rem_euclid(12) as usize;
+            let w = (buffer.samples() as u32 / 16).max(1);
+            let h = &self.meters.hist[pc];
+            h.store(h.load(Ordering::Relaxed).saturating_add(w), Ordering::Relaxed);
+        }
 
         ProcessStatus::Normal
     }

@@ -13,6 +13,7 @@
 //! both before and after the grain -> much steadier decisions than a purely causal tracker.
 //! Formants stay put because every grain keeps its own spectral envelope.
 
+use crate::formant::{FormantMode, FormantShifter};
 use std::f64::consts::PI;
 
 // ------------------------------------------------------------------------------------------
@@ -89,6 +90,28 @@ pub fn allowed_mask(scale: usize, key: usize, custom: u16) -> u16 {
 // Parameters
 // ------------------------------------------------------------------------------------------
 
+/// Number of extra (harmony / double) voices next to the corrected lead voice.
+pub const NUM_VOICES: usize = 2;
+
+/// One extra voice, sung from the same analysed signal as the lead.
+#[derive(Clone, Copy, Debug)]
+pub struct VoiceParams {
+    pub on: bool,
+    pub interval: f32,      // semitones relative to the corrected lead pitch
+    pub snap: bool,         // keep the interval inside the scale
+    pub level_db: f32,
+    pub pan: f32,           // -1..1
+    pub detune_cents: f32,
+    pub formant_semis: f32, // on top of the main formant shift
+    pub delay_ms: f32,
+}
+
+impl Default for VoiceParams {
+    fn default() -> Self {
+        Self { on: false, interval: 0.0, snap: false, level_db: -9.0, pan: 0.0, detune_cents: 0.0, formant_semis: 0.0, delay_ms: 0.0 }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Params {
     pub bypass: bool,
@@ -106,6 +129,15 @@ pub struct Params {
     pub fine_cents: f32,
     pub formant_semis: f32,
     pub formant_preserve: bool,
+    pub formant_mode: FormantMode,
+    pub formant_tilt: f32,   // -1..1, formant shift applied more to highs (+) or lows (-)
+    pub formant_follow: f32, // 0..1, how much the formants follow the pitch correction when not preserved
+    pub tracking: f32,       // 0..1, how reluctantly the tuner jumps to another note
+    pub bypass_mask: u16,    // pitch classes that are left uncorrected
+    pub vib_shape: usize,    // 0 sine, 1 triangle, 2 saw, 3 random
+    pub air_db: f32,         // high shelf on the wet signal
+    pub drive: f32,          // 0..1 soft saturation on the wet signal
+    pub voices: [VoiceParams; NUM_VOICES],
     pub vib_on: bool,
     pub vib_depth_cents: f32,
     pub vib_rate_hz: f32,
@@ -137,6 +169,15 @@ impl Default for Params {
             fine_cents: 0.0,
             formant_semis: 0.0,
             formant_preserve: true,
+            formant_mode: FormantMode::Classic,
+            formant_tilt: 0.0,
+            formant_follow: 1.0,
+            tracking: 0.22,
+            bypass_mask: 0,
+            vib_shape: 0,
+            air_db: 0.0,
+            drive: 0.0,
+            voices: [VoiceParams::default(); NUM_VOICES],
             vib_on: false,
             vib_depth_cents: 30.0,
             vib_rate_hz: 5.5,
@@ -170,6 +211,14 @@ struct Frame {
 }
 
 #[derive(Clone, Copy, Default)]
+struct Synth {
+    next_centre: f64,
+    next_decision: f64,
+    content_nom: f64,
+    prev_hs: f64,
+}
+
+#[derive(Clone, Copy, Default)]
 struct Biquad {
     b0: f64,
     b1: f64,
@@ -191,6 +240,24 @@ impl Biquad {
             b2: (1.0 + c) / 2.0 / a0,
             a1: -2.0 * c / a0,
             a2: (1.0 - alpha) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+    /// RBJ high shelf (S = 1).
+    fn highshelf(fs: f64, fc: f64, gain_db: f64) -> Self {
+        let a = 10f64.powf(gain_db / 40.0);
+        let w0 = 2.0 * PI * fc.min(fs * 0.45) / fs;
+        let (sn, cs) = w0.sin_cos();
+        let alpha = sn / 2.0 * 2f64.sqrt();
+        let sq = 2.0 * a.sqrt() * alpha;
+        let a0 = (a + 1.0) - (a - 1.0) * cs + sq;
+        Self {
+            b0: a * ((a + 1.0) + (a - 1.0) * cs + sq) / a0,
+            b1: -2.0 * a * ((a - 1.0) + (a + 1.0) * cs) / a0,
+            b2: a * ((a + 1.0) + (a - 1.0) * cs - sq) / a0,
+            a1: 2.0 * ((a - 1.0) - (a + 1.0) * cs) / a0,
+            a2: ((a + 1.0) - (a - 1.0) * cs - sq) / a0,
             z1: 0.0,
             z2: 0.0,
         }
@@ -251,12 +318,21 @@ pub struct Engine {
     marks: Vec<i64>,
     nmarks: u64,
 
-    // synthesis
+    // synthesis: voice 0 is the corrected lead, 1.. are the extra voices
     started: bool,
-    next_centre: f64,
-    next_decision: f64,
-    content_nom: f64,
-    prev_hs: f64,
+    syn: [Synth; NUM_VOICES + 1],
+    vact: [bool; NUM_VOICES + 1],
+    vdelta: [f64; NUM_VOICES], // smoothed interval (semitones) of the extra voices
+    cur_r: f64,                // pitch ratio chosen for the lead's latest grain
+    shifter: FormantShifter,
+    gbuf: [Vec<f32>; MAX_CH],
+
+    // wet-signal colour
+    air: [Biquad; MAX_CH],
+    air_cache: f32,
+    rng: u32,
+    rnd_prev: f64,
+    rnd_next: f64,
 
     // tuning state
     corr_sm: f64,
@@ -317,10 +393,17 @@ impl Engine {
             marks: vec![0; MARK_RING],
             nmarks: 0,
             started: false,
-            next_centre: 0.0,
-            next_decision: 0.0,
-            content_nom: 0.0,
-            prev_hs: fs / 150.0,
+            syn: [Synth::default(); NUM_VOICES + 1],
+            vact: [false; NUM_VOICES + 1],
+            vdelta: [0.0; NUM_VOICES],
+            cur_r: 1.0,
+            shifter: FormantShifter::new(((8.0 * fs / 40.0).ceil() as usize + 64).next_power_of_two()),
+            gbuf: [vec![0.0; (4.0 * fs / 40.0).ceil() as usize + 64], vec![0.0; (4.0 * fs / 40.0).ceil() as usize + 64]],
+            air: [Biquad::default(); MAX_CH],
+            air_cache: f32::NAN,
+            rng: 0x1234_5678,
+            rnd_prev: 0.0,
+            rnd_next: 0.0,
             corr_sm: 0.0,
             slow_midi: 60.0,
             note_age: 0.0,
@@ -365,7 +448,14 @@ impl Engine {
         self.nmarks = 0;
         self.last_period = self.fs / 150.0;
         self.started = false;
-        self.prev_hs = self.fs / 150.0;
+        self.syn = [Synth { prev_hs: self.fs / 150.0, ..Synth::default() }; NUM_VOICES + 1];
+        self.vact = [false; NUM_VOICES + 1];
+        self.vdelta = [0.0; NUM_VOICES];
+        self.cur_r = 1.0;
+        for a in self.air.iter_mut() {
+            a.z1 = 0.0;
+            a.z2 = 0.0;
+        }
         self.corr_sm = 0.0;
         self.slow_midi = 60.0;
         self.note_age = 0.0;
@@ -378,6 +468,15 @@ impl Engine {
 
     pub fn set_params(&mut self, p: &Params) {
         self.allowed_pc = allowed_mask(p.scale, p.key, p.custom_mask);
+        if p.air_db != self.air_cache {
+            self.air_cache = p.air_db;
+            for a in self.air.iter_mut() {
+                let (z1, z2) = (a.z1, a.z2);
+                *a = Biquad::highshelf(self.fs, 7000.0, p.air_db as f64);
+                a.z1 = z1;
+                a.z2 = z2;
+            }
+        }
         self.p = p.clone();
     }
 
@@ -434,22 +533,47 @@ impl Engine {
 
         if !self.started && self.w > 32 {
             self.started = true;
-            self.next_centre = o as f64 + self.fallback();
-            self.next_decision = o as f64;
-            self.content_nom = self.next_centre - self.latency as f64;
+            let nc = o as f64 + self.fallback();
+            let s0 = Synth { next_centre: nc, next_decision: o as f64, content_nom: nc - self.latency as f64, prev_hs: self.fallback() };
+            self.syn = [s0; NUM_VOICES + 1];
             self.nmarks = 0; // resync marks to the stream
             self.advance_marks();
         }
-        if self.started && o as f64 >= self.next_decision {
-            self.place_grain(o, nch);
+        if self.started && o as f64 >= self.syn[0].next_decision {
+            self.place_grain(0, o, nch);
+        }
+        if self.started {
+            for v in 1..=NUM_VOICES {
+                if self.p.voices[v - 1].on && !self.p.bypass {
+                    if !self.vact[v] {
+                        // join in step with the lead
+                        self.syn[v] = self.syn[0];
+                        self.vact[v] = true;
+                    }
+                    if o as f64 >= self.syn[v].next_decision {
+                        self.place_grain(v, o, nch);
+                    }
+                } else {
+                    self.vact[v] = false;
+                }
+            }
         }
 
         // output
         let mut out = [0.0f32; MAX_CH];
         let oi = (o & self.ring_mask) as usize;
+        let drive = self.p.drive.clamp(0.0, 1.0);
+        let air_on = self.p.air_db.abs() > 0.05;
         for c in 0..nch {
-            let wet = self.ola[c][oi];
+            let mut wet = self.ola[c][oi];
             self.ola[c][oi] = 0.0;
+            if air_on {
+                wet = self.air[c].tick(wet as f64) as f32;
+            }
+            if drive > 0.0 {
+                let g = 1.0 + 3.0 * drive;
+                wet = (wet * g).tanh() / g.sqrt();
+            }
             let dry = rd(&self.ring[c], self.ring_mask, o - self.latency);
             let y = if self.p.bypass { dry } else { dry * (1.0 - mix) + wet * mix };
             out[c] = y * out_gain;
@@ -728,9 +852,9 @@ impl Engine {
             self.have_note = false;
             return false;
         };
-        const HYST: f64 = 0.15;
+        let hyst = 0.05 + 0.45 * (self.p.tracking as f64).clamp(0.0, 1.0);
         if self.have_note && self.is_allowed(self.cur_note) {
-            if best != self.cur_note && (basis - self.cur_note as f64).abs() > bd + HYST {
+            if best != self.cur_note && (basis - self.cur_note as f64).abs() > bd + hyst {
                 self.cur_note = best;
                 self.note_age = 0.0;
                 self.transition = true;
@@ -776,6 +900,9 @@ impl Engine {
             let fl = self.p.flex_cents as f64 / 100.0;
             err = if err > fl { err - fl } else if err < -fl { err + fl } else { 0.0 };
             err *= (self.p.amount as f64).clamp(0.0, 1.0);
+            if (self.p.bypass_mask >> (self.cur_note.rem_euclid(12) as u32)) & 1 == 1 {
+                err = 0.0; // this note is flagged BYPASS: sing it as it is
+            }
         }
 
         // glide time: Note Transition while moving onto a newly selected note,
@@ -801,9 +928,24 @@ impl Engine {
             self.vib_phase += 2.0 * PI * self.p.vib_rate_hz as f64 * dt;
             if self.vib_phase > 2.0 * PI {
                 self.vib_phase -= 2.0 * PI;
+                self.rnd_prev = self.rnd_next;
+                self.rng ^= self.rng << 13;
+                self.rng ^= self.rng >> 17;
+                self.rng ^= self.rng << 5;
+                self.rnd_next = self.rng as f64 / u32::MAX as f64 * 2.0 - 1.0;
             }
+            let ph = self.vib_phase;
+            let shape = match self.p.vib_shape {
+                1 => 2.0 / PI * ph.sin().asin(),                // triangle
+                2 => (ph / PI - 1.0) * 0.9,                      // saw
+                3 => {
+                    let t = ph / (2.0 * PI);
+                    self.rnd_prev + (self.rnd_next - self.rnd_prev) * t * t * (3.0 - 2.0 * t) // wander
+                }
+                _ => ph.sin(),
+            };
             let ramp = ((self.note_age - self.p.vib_delay_ms as f64 / 1000.0) / 0.3).clamp(0.0, 1.0);
-            vib = self.p.vib_depth_cents as f64 / 100.0 * ramp * self.vib_phase.sin();
+            vib = self.p.vib_depth_cents as f64 / 100.0 * ramp * shape;
         }
 
         let total = (self.corr_sm + vib + user).clamp(-12.0, 12.0);
@@ -829,28 +971,85 @@ impl Engine {
         ((c3 * f + c2) * f + c1) * f + y1
     }
 
-    fn place_grain(&mut self, o: i64, nch: usize) {
+    /// Interval (in semitones) from `base` to the allowed note nearest to base + iv.
+    fn snap_interval(&self, base: i32, iv: f32) -> f64 {
+        let k = iv.round() as i32;
+        let sg = if iv < 0.0 { -1 } else { 1 };
+        for d in [0, -sg, sg, -2 * sg, 2 * sg] {
+            if self.is_allowed(base + k + d) {
+                return (k + d) as f64;
+            }
+        }
+        iv as f64
+    }
+
+    /// Classic time-domain grain: read the source at rate `s` (moves formants with the resampling).
+    #[allow(clippy::too_many_arguments)]
+    fn add_classic(&mut self, nch: usize, m: i64, f: f64, hg: i64, kmin: i64, oi: i64, scale: f64, s: f64, gain: [f32; MAX_CH], dly: i64) {
+        for k in kmin..hg {
+            let u = k as f64 - f;
+            let wv = (scale * 0.5 * (1.0 + (PI * u / hg as f64).cos())) as f32;
+            let sp = m as f64 + u * s;
+            let idx = ((oi + k + dly) & self.ring_mask) as usize;
+            for ch in 0..nch {
+                let v = self.read_cubic(ch, sp);
+                self.ola[ch][idx] += wv * v * gain[ch];
+            }
+        }
+    }
+
+    fn place_grain(&mut self, vi: usize, o: i64, nch: usize) {
+        let mut sy = self.syn[vi];
         // choose the analysis centre: the nearest pitch mark, unless marks are too sparse here
         // (e.g. just after an unvoiced stretch) - then use the wanted position itself.
-        let (_, p0) = self.query(self.content_nom);
-        let mut m = self.pick_mark(self.content_nom);
-        if (m as f64 - self.content_nom).abs() > 0.6 * p0 {
-            m = self.content_nom.round() as i64;
+        let (_, p0) = self.query(sy.content_nom);
+        let mut m = self.pick_mark(sy.content_nom);
+        if (m as f64 - sy.content_nom).abs() > 0.6 * p0 {
+            m = sy.content_nom.round() as i64;
         }
         let (voiced, pq) = self.query(m as f64);
         let p = if voiced { pq } else { self.fallback() };
+        let dt = sy.prev_hs / self.fs;
 
-        let dt = self.prev_hs / self.fs;
-        let r = self.compute_ratio(dt, voiced, p);
+        let mut gain = [1.0f32; MAX_CH];
+        let mut dly = 0i64;
+        let mut vformant = 0.0f32;
+        let r;
+        if vi == 0 {
+            r = self.compute_ratio(dt, voiced, p);
+            self.cur_r = r;
+            for v in 0..NUM_VOICES {
+                let vp = self.p.voices[v];
+                let target = if vp.snap && self.have_note && voiced { self.snap_interval(self.cur_note, vp.interval) } else { vp.interval as f64 };
+                let tau = (self.p.transition_ms as f64 / 1000.0).max(0.01);
+                self.vdelta[v] += (target - self.vdelta[v]) * (1.0 - (-dt / tau).exp());
+            }
+        } else {
+            let vp = self.p.voices[vi - 1];
+            r = if voiced { self.cur_r * 2f64.powf((self.vdelta[vi - 1] + vp.detune_cents as f64 / 100.0) / 12.0) } else { 1.0 };
+            let lv = 10f32.powf(vp.level_db / 20.0);
+            if nch == 2 {
+                let a = (vp.pan.clamp(-1.0, 1.0) + 1.0) * 0.25 * std::f32::consts::PI;
+                gain = [lv * a.cos() * std::f32::consts::SQRT_2, lv * a.sin() * std::f32::consts::SQRT_2];
+            } else {
+                gain = [lv, lv];
+            }
+            dly = (vp.delay_ms as f64 * self.fs / 1000.0) as i64;
+            vformant = vp.formant_semis;
+        }
 
         let hs = p / r;
         let hg = (p.max(hs).ceil() as i64).max(8);
-        let s = (2f64.powf(self.p.formant_semis as f64 / 12.0)
-            * if self.p.formant_preserve { 1.0 } else { r })
-        .clamp(0.5, 2.0);
+        let follow = if self.p.formant_preserve { 0.0 } else { self.p.formant_follow as f64 };
+        let s_raw = 2f64.powf((self.p.formant_semis + vformant) as f64 / 12.0) * r.powf(follow);
+        let mode = self.p.formant_mode;
+        let spectral = mode != FormantMode::Classic && s_raw.ln().abs() > 0.002 && (2 * hg) as usize <= self.gbuf[0].len();
+        let s_cl = if mode == FormantMode::Classic { s_raw.clamp(0.5, 2.0) } else { 1.0 };
 
-        let tc = self.next_centre;
-        self.dbg_lag = (tc - m as f64) - self.latency as f64;
+        let tc = sy.next_centre;
+        if vi == 0 {
+            self.dbg_lag = (tc - m as f64) - self.latency as f64;
+        }
         let oi = tc.floor() as i64;
         let f = tc - oi as f64;
         let scale = hs / hg as f64;
@@ -860,31 +1059,222 @@ impl Engine {
         if clipped {
             kmin = o - oi;
         }
-        if self.debug {
+        if self.debug && vi == 0 {
             eprintln!("o={:.4}s tc={:.0} m={} voiced={} p={:.0} r={:.3} hs={:.0} hg={} lag={:.0} clipped={} (lost {} samp)", o as f64 / self.fs, tc, m, voiced, p, r, hs, hg, self.dbg_lag, clipped, if clipped { o - (oi - hg) } else { 0 });
         }
-        for k in kmin..hg {
-            let u = k as f64 - f;
-            let wv = (scale * 0.5 * (1.0 + (PI * u / hg as f64).cos())) as f32;
-            let sp = m as f64 + u * s;
-            let idx = ((oi + k) & self.ring_mask) as usize;
+
+        if vi > 0 && !voiced {
+            // extra voices stay silent on consonants and breaths
+        } else if !spectral {
+            self.add_classic(nch, m, f, hg, kmin, oi, scale, s_cl, gain, dly);
+        } else {
+            let l = (2 * hg) as usize;
+            let s = s_raw.clamp(0.4, 2.5);
+            let tilt = self.p.formant_tilt as f64;
             for ch in 0..nch {
-                let v = self.read_cubic(ch, sp);
-                self.ola[ch][idx] += wv * v;
+                for j in 0..l {
+                    let u = (j as i64 - hg) as f64 - f;
+                    let wv = (scale * 0.5 * (1.0 + (PI * u / hg as f64).cos())) as f32;
+                    self.gbuf[ch][j] = wv * self.read_cubic(ch, m as f64 + u);
+                }
+            }
+            let ok = {
+                let (g0, g1) = self.gbuf.split_at_mut(1);
+                let right = if nch == 2 { Some(&mut g1[0][..l]) } else { None };
+                self.shifter.process2(&mut g0[0][..l], right, p, self.fs, mode, s, tilt)
+            };
+            if ok {
+                for k in kmin..hg {
+                    let idx = ((oi + k + dly) & self.ring_mask) as usize;
+                    for ch in 0..nch {
+                        self.ola[ch][idx] += self.gbuf[ch][(k + hg) as usize] * gain[ch];
+                    }
+                }
+            } else {
+                self.add_classic(nch, m, f, hg, kmin, oi, scale, s.clamp(0.5, 2.0), gain, dly);
             }
         }
 
-        self.next_centre = tc + hs;
+        sy.next_centre = tc + hs;
         // continue from the chosen mark; slowly pull back towards the nominal latency
         let nom = m as f64 + hs;
-        let lag_err = (self.next_centre - self.latency as f64) - nom;
-        self.content_nom = nom + (self.pull * lag_err).clamp(-0.5 * hs, 0.5 * hs);
-        self.prev_hs = hs;
-        self.next_decision = self.next_centre - (1.3 * p.max(hs).max(self.fallback()) + 4.0);
-        if self.next_decision < o as f64 - hs {
-            self.next_centre = o as f64 + hs;
-            self.next_decision = o as f64;
-            self.content_nom = self.next_centre - self.latency as f64;
+        let lag_err = (sy.next_centre - self.latency as f64) - nom;
+        sy.content_nom = nom + (self.pull * lag_err).clamp(-0.5 * hs, 0.5 * hs);
+        sy.prev_hs = hs;
+        sy.next_decision = sy.next_centre - (1.3 * p.max(hs).max(self.fallback()) + 4.0);
+        if sy.next_decision < o as f64 - hs {
+            sy.next_centre = o as f64 + hs;
+            sy.next_decision = o as f64;
+            sy.content_nom = sy.next_centre - self.latency as f64;
         }
+        self.syn[vi] = sy;
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// Key detection (Krumhansl-Kessler profiles) and scale learning from a pitch-class histogram
+// ------------------------------------------------------------------------------------------
+
+/// Returns (key 0..11 with 0 = C, scale index into SCALE_NAMES (Major = 1, Natural Minor = 2), correlation).
+pub fn detect_key(hist: &[f32; 12]) -> Option<(usize, usize, f32)> {
+    const MAJ: [f32; 12] = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+    const MIN: [f32; 12] = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+    let total: f32 = hist.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let mean_h = total / 12.0;
+    let corr = |prof: &[f32; 12], key: usize| -> f32 {
+        let mp: f32 = prof.iter().sum::<f32>() / 12.0;
+        let (mut num, mut dh, mut dp) = (0.0, 0.0, 0.0);
+        for i in 0..12 {
+            let a = hist[(key + i) % 12] - mean_h;
+            let b = prof[i] - mp;
+            num += a * b;
+            dh += a * a;
+            dp += b * b;
+        }
+        num / (dh.sqrt() * dp.sqrt() + 1e-12)
+    };
+    let mut best = (0usize, 1usize, f32::MIN);
+    for key in 0..12 {
+        for (sc, prof) in [(1usize, &MAJ), (2usize, &MIN)] {
+            let c = corr(prof, key);
+            if c > best.2 {
+                best = (key, sc, c);
+            }
+        }
+    }
+    Some(best)
+}
+
+/// Pitch classes that were sung noticeably often (at least `frac` of the most frequent one).
+pub fn learn_mask(hist: &[f32; 12], frac: f32) -> u16 {
+    let mx = hist.iter().cloned().fold(0.0f32, f32::max);
+    if mx <= 0.0 {
+        return 0xFFF;
+    }
+    let mut m = 0u16;
+    for (i, h) in hist.iter().enumerate() {
+        if *h >= mx * frac {
+            m |= 1 << i;
+        }
+    }
+    m
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+
+    fn xorshift(s: &mut u32) -> f32 {
+        *s ^= *s << 13;
+        *s ^= *s >> 17;
+        *s ^= *s << 5;
+        *s as f32 / u32::MAX as f32
+    }
+
+    fn voice_signal(fs: f64, secs: f64, seed: &mut u32) -> Vec<f32> {
+        let n = (fs * secs) as usize;
+        let mut ph = 0.0f64;
+        let mut f0 = 150.0f64;
+        let mut out = Vec::with_capacity(n);
+        let (mut y1, mut y2) = (0.0f64, 0.0f64);
+        for i in 0..n {
+            if i % (fs as usize / 3) == 0 {
+                f0 = 90.0 * 2f64.powf(xorshift(seed) as f64 * 2.5);
+            }
+            ph += f0 / fs;
+            let src = if ph % 1.0 < 0.05 { 1.0 } else { -0.05 } + 0.02 * (xorshift(seed) as f64 - 0.5);
+            let th = 2.0 * PI * 700.0 / fs;
+            let r = 0.985;
+            let y = src * 0.1 + 2.0 * r * th.cos() * y1 - r * r * y2;
+            y2 = y1;
+            y1 = y;
+            // silence gaps, now and then
+            let gate = if (i / (fs as usize / 5)) % 7 == 6 { 0.0 } else { 1.0 };
+            out.push((y * 0.3 * gate) as f32);
+        }
+        out
+    }
+
+    #[test]
+    fn random_parameters_never_blow_up() {
+        let mut seed = 0xC0FFEEu32;
+        for &fs in &[44100.0f64, 48000.0, 96000.0] {
+            for nch in 1..=2usize {
+                let x = voice_signal(fs, 6.0, &mut seed);
+                let mut e = Engine::new(fs, 70.0);
+                let mut p = Params::default();
+                let mut peak = 0.0f32;
+                for (bi, chunk) in x.chunks(257).enumerate() {
+                    if bi % 4 == 0 {
+                        p.scale = (xorshift(&mut seed) * 17.0) as usize % 17;
+                        p.key = (xorshift(&mut seed) * 12.0) as usize % 12;
+                        p.retune_ms = xorshift(&mut seed) * 400.0;
+                        p.transition_ms = xorshift(&mut seed) * 400.0;
+                        p.amount = xorshift(&mut seed);
+                        p.flex_cents = xorshift(&mut seed) * 100.0;
+                        p.humanize = xorshift(&mut seed);
+                        p.natural_vib = xorshift(&mut seed);
+                        p.transpose = (xorshift(&mut seed) * 24.0 - 12.0).round();
+                        p.fine_cents = xorshift(&mut seed) * 200.0 - 100.0;
+                        p.formant_semis = xorshift(&mut seed) * 24.0 - 12.0;
+                        p.formant_preserve = xorshift(&mut seed) > 0.5;
+                        p.formant_mode = FormantMode::from_index((xorshift(&mut seed) * 5.0) as usize % 5);
+                        p.formant_tilt = xorshift(&mut seed) * 2.0 - 1.0;
+                        p.formant_follow = xorshift(&mut seed);
+                        p.tracking = xorshift(&mut seed);
+                        p.bypass_mask = (xorshift(&mut seed) * 4096.0) as u16;
+                        p.vib_on = xorshift(&mut seed) > 0.5;
+                        p.vib_shape = (xorshift(&mut seed) * 4.0) as usize % 4;
+                        p.air_db = xorshift(&mut seed) * 18.0 - 6.0;
+                        p.drive = xorshift(&mut seed);
+                        p.bypass = xorshift(&mut seed) > 0.9;
+                        p.mix = xorshift(&mut seed);
+                        for v in p.voices.iter_mut() {
+                            v.on = xorshift(&mut seed) > 0.4;
+                            v.interval = (xorshift(&mut seed) * 48.0 - 24.0).round();
+                            v.snap = xorshift(&mut seed) > 0.5;
+                            v.level_db = xorshift(&mut seed) * 36.0 - 30.0;
+                            v.pan = xorshift(&mut seed) * 2.0 - 1.0;
+                            v.detune_cents = xorshift(&mut seed) * 100.0 - 50.0;
+                            v.formant_semis = xorshift(&mut seed) * 24.0 - 12.0;
+                            v.delay_ms = xorshift(&mut seed) * 60.0;
+                        }
+                    }
+                    e.set_params(&p);
+                    for &s in chunk {
+                        let o = e.process_frame([s, s * 0.7], nch);
+                        for c in 0..nch {
+                            assert!(o[c].is_finite(), "non-finite output (fs {fs}, nch {nch})");
+                            peak = peak.max(o[c].abs());
+                        }
+                    }
+                }
+                let inpk = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                assert!(peak < 8.0 * inpk.max(0.1), "peak {peak} input peak {inpk} (fs {fs}, nch {nch})");
+            }
+        }
+    }
+
+    #[test]
+    fn key_detection_and_learning() {
+        // C major scale usage
+        let mut h = [0.0f32; 12];
+        for (pc, w) in [(0, 10.0), (2, 6.0), (4, 8.0), (5, 5.0), (7, 9.0), (9, 6.0), (11, 4.0)] {
+            h[pc] = w * 100.0;
+        }
+        let (k, sc, c) = detect_key(&h).unwrap();
+        assert_eq!((k, sc), (0, 1), "corr {c}");
+        // same shifted to A minor-ish emphasis
+        let mut m = [0.0f32; 12];
+        for (pc, w) in [(9, 10.0), (11, 5.0), (0, 8.0), (2, 6.0), (4, 9.0), (5, 5.0), (7, 4.0)] {
+            m[pc] = w * 100.0;
+        }
+        let (k, sc, _) = detect_key(&m).unwrap();
+        assert_eq!((k, sc), (9, 2));
+        assert_eq!(learn_mask(&h, 0.12), 0b1010_1011_0101);
+        assert!(detect_key(&[0.0; 12]).is_none());
     }
 }
