@@ -1202,26 +1202,29 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     knob(ui, setter, &p.transpose, "Transpose", c[0], "", true);
                     knob(ui, setter, &p.fine, "Detune", c[1], "", true);
 
-                    let g2 = group(ui, 214.0, row1, 672.0, "02", "FORMANT");
-                    enum_combo(ui, setter, &p.fmode, "fmode", Rect::from_min_size(Pos2::new(g2.left() + 112.0, g2.top() + 6.0), Vec2::new(150.0, 20.0)));
-                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 270.0, g2.top() + 6.0), Vec2::new(44.0, 18.0)), "ON", p.formant_on.value()) {
+                    let g2 = group(ui, 214.0, row1, 400.0, "02", "FORMANT");
+                    enum_combo(ui, setter, &p.fmode, "fmode", Rect::from_min_size(Pos2::new(g2.left() + 112.0, g2.top() + 6.0), Vec2::new(124.0, 20.0)));
+                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 244.0, g2.top() + 6.0), Vec2::new(40.0, 18.0)), "ON", p.formant_on.value()) {
                         set_b(setter, &p.formant_on, !p.formant_on.value());
-                    }
-                    if pill(ui, Rect::from_min_size(Pos2::new(g2.left() + 322.0, g2.top() + 6.0), Vec2::new(98.0, 18.0)), "COLOUR ON", p.colour_on.value()) {
-                        set_b(setter, &p.colour_on, !p.colour_on.value());
                     }
                     if pill(ui, Rect::from_min_size(Pos2::new(g2.right() - 106.0, g2.top() + 6.0), Vec2::new(98.0, 18.0)), "KEEP FORMANTS", p.keep_formants.value()) {
                         set_b(setter, &p.keep_formants, !p.keep_formants.value());
                     }
-                    let c = cells(g2, 5);
+                    let c = cells(g2, 3);
                     knob(ui, setter, &p.formant, "Shift", c[0], "Moves the vocal-tract resonances (gender / size) independently of pitch.", true);
                     knob(ui, setter, &p.ftilt, "Tilt", c[1], "Spectral algorithms: + moves the high formants more than the low ones (brighter, smaller), - the opposite.", true);
                     knob(ui, setter, &p.ffollow, "Follow", c[2], "With KEEP FORMANTS off: how much the formants follow the pitch correction (100 % = like a varispeed).", false);
-                    knob(ui, setter, &p.air, "Air", c[3], "High shelf (7 kHz) on the processed voice. Brightness / breath.", false);
-                    knob(ui, setter, &p.drive, "Drive", c[4], "Soft saturation of the processed voice.", false);
+
+                    let g3 = group(ui, 624.0, row1, 262.0, "03", "COLOUR");
+                    if pill(ui, Rect::from_min_size(Pos2::new(g3.right() - 52.0, g3.top() + 6.0), Vec2::new(44.0, 18.0)), "ON", p.colour_on.value()) {
+                        set_b(setter, &p.colour_on, !p.colour_on.value());
+                    }
+                    let c = cells(g3, 2);
+                    knob(ui, setter, &p.air, "Air", c[0], "High shelf (7 kHz) on the processed voice: brightness / breath.", false);
+                    knob(ui, setter, &p.drive, "Drive", c[1], "Soft saturation of the processed voice: warmth and grit.", false);
 
                     // warp curve: where a formant of the source ends up
-                    let g3 = group(ui, 14.0, row2, 430.0, "03", "FORMANT MAP");
+                    let g3 = group(ui, 14.0, row2, 430.0, "04", "FORMANT MAP");
                     let plot = Rect::from_min_max(Pos2::new(g3.left() + 44.0, g3.top() + 30.0), Pos2::new(g3.right() - 16.0, g3.bottom() - 22.0));
                     painter.rect_filled(plot, CornerRadius::same(3), BG);
                     painter.rect_stroke(plot, CornerRadius::same(3), Stroke::new(1.0_f32, LINE), StrokeKind::Inside);
@@ -1252,7 +1255,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     painter.text(Pos2::new(g3.left() + 12.0, g3.top() + 20.0 + 0.0), Align2::LEFT_CENTER, "", mono(9.0), DIM);
                     painter.text(Pos2::new(plot.right() - 6.0, plot.bottom() - 8.0), Align2::RIGHT_CENTER, "source formant", mono(8.5), DIM);
 
-                    let g4 = group(ui, 454.0, row2, 432.0, "04", "ALGORITHM");
+                    let g4 = group(ui, 454.0, row2, 432.0, "05", "ALGORITHM");
                     let (head, body): (&str, &[&str]) = match mode {
                         FormantAlgo::Classic => ("Classic", &["Every grain is resampled. Cheap and solid,", "the old-school PSOLA sound. Shift moves all", "formants evenly; Tilt does not apply."]),
                         FormantAlgo::Smooth => ("Smooth", &["Spectral. A broad envelope is moved, the fine", "structure stays. Most natural, hardest to break,", "good for subtle gender / size changes."]),
