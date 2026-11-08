@@ -5,7 +5,6 @@ use crate::egui::ViewportCommand;
 use crate::EguiState;
 #[cfg(not(target_os = "linux"))]
 use baseview::gl::GlConfig;
-use baseview::PhySize;
 use baseview::{Size, WindowHandle, WindowOpenOptions, WindowScalePolicy};
 use crossbeam::atomic::AtomicCell;
 use egui_baseview::egui::Context;
@@ -125,7 +124,7 @@ where
                     // Ask the plugin host to resize to self.size()
                     if context.request_resize() {
                         // Resize the content of egui window
-                        queue.resize(PhySize::new(new_size.0, new_size.1));
+                        queue.resize_host_units(new_size.0, new_size.1);
                         egui_ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
                             new_size.0 as f32,
                             new_size.1 as f32,

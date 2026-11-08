@@ -1256,6 +1256,77 @@ mod fuzz_tests {
         assert!(pk < 1.0, "peak {pk}");
     }
 
+
+    /// Quality check on a vowel-like voice 40 cents sharp: the output must sit on the note (within 3 cents),
+    /// keep its level (+-1.5 dB) and stay harmonic (little non-harmonic energy = no grit / warble).
+    #[test]
+    fn corrected_voice_is_in_tune_loud_enough_and_clean() {
+        let fs = 48000.0f64;
+        let n = (fs * 3.0) as usize;
+        let f_in = 220.0 * 2f64.powf(40.0 / 1200.0);
+        let (mut y1, mut y2) = (0.0f64, 0.0f64);
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let ph = (i as f64 * f_in / fs) % 1.0;
+                let src = if ph < 0.05 { 1.0 } else { -0.05 };
+                let r = 0.985;
+                let th = 2.0 * PI * 800.0 / fs;
+                let y = src * 0.1 + 2.0 * r * th.cos() * y1 - r * r * y2;
+                y2 = y1;
+                y1 = y;
+                (y * 2.0) as f32
+            })
+            .collect();
+        let pk = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let x: Vec<f32> = x.iter().map(|v| v * 0.4 / pk).collect();
+        let mut e = Engine::new(fs, 70.0);
+        let mut p = Params::default();
+        p.scale = 0;
+        p.retune_ms = 0.0;
+        p.amount = 1.0;
+        p.mix = 1.0;
+        let mut out = Vec::with_capacity(n);
+        for ch in x.chunks(128) {
+            e.set_params(&p);
+            for &s in ch {
+                out.push(e.process_frame([s, s], 1)[0]);
+            }
+        }
+        let seg = &out[fs as usize..];
+        let rms = |v: &[f32]| (v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+        let db = 20.0 * (rms(seg) / rms(&x[fs as usize..])).log10();
+        assert!(db.abs() < 1.5, "level change {db:.2} dB");
+        // fundamental by scanning DFT around 220 Hz in 0.5 cent steps
+        let dft = |fr: f64| {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, s) in seg.iter().enumerate() {
+                let w = 0.5 - 0.5 * (2.0 * PI * i as f64 / seg.len() as f64).cos();
+                let a = 2.0 * PI * fr * i as f64 / fs;
+                re += *s as f64 * w * a.cos();
+                im += *s as f64 * w * a.sin();
+            }
+            re * re + im * im
+        };
+        let (mut best, mut bf) = (0.0f64, 0.0f64);
+        for c in -300..=300 {
+            let fr = 220.0 * 2f64.powf(c as f64 * 0.1 / 1200.0);
+            let en = dft(fr);
+            if en > best {
+                best = en;
+                bf = fr;
+            }
+        }
+        let cents = 1200.0 * (bf / 220.0).log2();
+        assert!(cents.abs() < 3.0, "off by {cents:.2} cents (f {bf:.2})");
+        let (mut harm, mut inter) = (0.0f64, 0.0f64);
+        for k in 1..=15 {
+            harm += dft(220.0 * k as f64);
+            inter += dft(220.0 * (k as f64 + 0.5));
+        }
+        let ratio = 10.0 * (harm / inter.max(1e-30)).log10();
+        assert!(ratio > 25.0, "harmonic / in-between = {ratio:.1} dB");
+    }
+
     #[test]
     fn random_parameters_never_blow_up() {
         let mut seed = 0xC0FFEEu32;

@@ -102,6 +102,11 @@ impl<'a> Window<'a> {
         self.window.set_mouse_cursor(cursor);
     }
 
+    /// Only meaningful on X11: stop receiving key events so the host can handle them.
+    pub fn set_keyboard_events(&mut self, on: bool) {
+        self.window.set_keyboard_events(on);
+    }
+
     pub fn has_focus(&mut self) -> bool {
         self.window.has_focus()
     }

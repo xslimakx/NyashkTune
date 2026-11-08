@@ -812,6 +812,8 @@ impl Window<'_> {
         self.state.deferred_tasks.borrow_mut().push_back(task);
     }
 
+    pub fn set_keyboard_events(&mut self, _on: bool) {}
+
     pub fn set_mouse_cursor(&mut self, mouse_cursor: MouseCursor) {
         self.state.cursor_icon.set(mouse_cursor);
         unsafe {

@@ -1351,7 +1351,8 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 let gr = ui.interact(grip, egui::Id::new("nt_resize_grip"), Sense::drag()).on_hover_text("Drag to resize");
                 if gr.dragged() {
                     if let Some(pos) = gr.interact_pointer_pos() {
-                        let ppp = ctx.pixels_per_point();
+                        // host units: pixels on Windows / Linux, logical points on macOS (egui's scale there is Retina x our UI scale)
+                        let ppp = if cfg!(target_os = "macos") { size_state.size().0 as f32 / BASE_W } else { ctx.pixels_per_point() };
                         let w = ((pos.x - full.min.x + 11.0) * ppp).clamp(540.0, 2400.0);
                         let h = w * BASE_H / BASE_W;
                         size_state.set_requested_size((w.round() as u32, h.round() as u32));

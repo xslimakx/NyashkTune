@@ -335,6 +335,8 @@ impl<'a> Window<'a> {
         }
     }
 
+    pub fn set_keyboard_events(&mut self, _on: bool) {}
+
     pub fn set_mouse_cursor(&mut self, _mouse_cursor: MouseCursor) {
         todo!()
     }

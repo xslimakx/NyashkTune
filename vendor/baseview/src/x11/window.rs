@@ -365,6 +365,28 @@ impl<'a> Window<'a> {
         self.inner.close_requested.set(true);
     }
 
+    /// Listen to key events only while the plugin needs them (text entry). Without the key
+    /// event mask, key presses propagate up to the host window, so e.g. space still starts
+    /// and stops the DAW transport.
+    pub fn set_keyboard_events(&mut self, on: bool) {
+        let mut mask = EventMask::EXPOSURE
+            | EventMask::POINTER_MOTION
+            | EventMask::BUTTON_PRESS
+            | EventMask::BUTTON_RELEASE
+            | EventMask::STRUCTURE_NOTIFY
+            | EventMask::ENTER_WINDOW
+            | EventMask::LEAVE_WINDOW;
+        if on {
+            mask |= EventMask::KEY_PRESS | EventMask::KEY_RELEASE;
+        }
+        let _ = self
+            .inner
+            .xcb_connection
+            .conn
+            .change_window_attributes(self.inner.window_id, &ChangeWindowAttributesAux::new().event_mask(mask));
+        let _ = self.inner.xcb_connection.conn.flush();
+    }
+
     pub fn has_focus(&mut self) -> bool {
         unimplemented!()
     }

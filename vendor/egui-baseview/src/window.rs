@@ -16,6 +16,7 @@ pub struct Queue<'a> {
     close_requested: &'a mut bool,
     physical_size: &'a mut PhySize,
     ui_scale: &'a mut f32,
+    native_scale: f32,
 }
 
 impl<'a> Queue<'a> {
@@ -24,9 +25,11 @@ impl<'a> Queue<'a> {
         close_requested: &'a mut bool,
         physical_size: &'a mut PhySize,
         ui_scale: &'a mut f32,
+        native_scale: f32,
     ) -> Self {
         Self {
             ui_scale,
+            native_scale,
             bg_color,
             //renderer,
             //repaint_requested,
@@ -43,6 +46,15 @@ impl<'a> Queue<'a> {
     /// Set size of the window.
     pub fn resize(&mut self, physical_size: PhySize) {
         *self.physical_size = physical_size;
+    }
+
+    /// Set the window size given in the host's units. On macOS those are logical points, while the
+    /// renderer works in physical pixels (x2 on Retina): passing points as pixels is what made the
+    /// UI collapse into a small square after a resize. On Windows / Linux the host size is already
+    /// in pixels.
+    pub fn resize_host_units(&mut self, w: u32, h: u32) {
+        let k = if cfg!(target_os = "macos") { self.native_scale.max(1.0) } else { 1.0 };
+        *self.physical_size = PhySize::new((w as f32 * k).round() as u32, (h as f32 * k).round() as u32);
     }
 
     /// Extra uniform scale applied on top of the native DPI scale (1.0 = none).
@@ -98,6 +110,7 @@ where
     egui_input: egui::RawInput,
     pointer_pos_in_points: Option<egui::Pos2>,
     current_cursor_icon: baseview::MouseCursor,
+    kb_events: bool,
 
     renderer: Renderer,
 
@@ -181,7 +194,7 @@ where
         let mut bg_color = Rgba::BLACK;
         let mut close_requested = false;
         let mut ui_scale_init = 1.0f32;
-        let mut queue = Queue::new(&mut bg_color, &mut close_requested, &mut physical_size, &mut ui_scale_init);
+        let mut queue = Queue::new(&mut bg_color, &mut close_requested, &mut physical_size, &mut ui_scale_init, 1.0);
         (build)(&egui_ctx, &mut queue, &mut state);
 
         let clipboard_ctx = match copypasta::ClipboardContext::new() {
@@ -203,6 +216,7 @@ where
             start_time,
             egui_input,
             pointer_pos_in_points: None,
+            kb_events: true,
             current_cursor_icon: baseview::MouseCursor::Default,
 
             renderer,
@@ -336,6 +350,7 @@ where
             &mut self.close_requested,
             &mut self.physical_size,
             &mut self.ui_scale,
+            self.pixels_per_point,
         );
 
         let t_frame = Instant::now();
@@ -436,6 +451,16 @@ where
             // TODO: Set mouse cursor for MacOS once baseview supports it.
             #[cfg(not(target_os = "macos"))]
             window.set_mouse_cursor(cursor_icon);
+        }
+
+        // take keyboard events only while egui edits text, so the DAW keeps its shortcuts (space = play)
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let want = self.egui_ctx.wants_keyboard_input();
+            if want != self.kb_events {
+                self.kb_events = want;
+                window.set_keyboard_events(want);
+            }
         }
 
         // A temporary workaround for keyboard input not working sometimes in Windows.

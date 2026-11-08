@@ -488,7 +488,7 @@ impl Default for NyashkTune {
 
 impl Plugin for NyashkTune {
     const NAME: &'static str = "NyashkTune";
-    const VENDOR: &'static str = "NyashkTune";
+    const VENDOR: &'static str = "Nyashk";
     const URL: &'static str = "https://github.com/xslimakx/NyashkTune";
     const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
