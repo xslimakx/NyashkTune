@@ -57,16 +57,29 @@ jobs:
           path: "*-${{ matrix.name }}-VST3.zip"
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # tags (v*) publish as before; a push to main publishes the version in Cargo.toml
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: "*-VST3.zip"
-          generate_release_notes: true
-          body_path: RELEASE_NOTES.md
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="v$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          fi
+          echo "Release $TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip --clobber
+            gh release edit "$TAG" --notes-file RELEASE_NOTES.md
+          else
+            gh release create "$TAG" dist/*.zip --target "$GITHUB_SHA" --title "$TAG" --notes-file RELEASE_NOTES.md
+          fi
