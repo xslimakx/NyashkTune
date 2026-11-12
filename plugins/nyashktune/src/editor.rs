@@ -22,12 +22,34 @@ pub(crate) const WHITE: Color32 = Color32::from_rgb(0xf2, 0xf2, 0xf2);
 pub(crate) const DIM: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
 pub(crate) const MID: Color32 = Color32::from_rgb(0x7a, 0x7a, 0x7a);
 
-const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const NOTE_SHARP: [&str; 12] = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
+const NOTE_FLAT: [&str; 12] = ["C", "D♭", "D", "E♭", "E", "F", "G♭", "G", "A♭", "A", "B♭", "B"];
+/// GUI naming preference (sharps / flats), mirrored from the persisted setting every frame.
+static FLATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_name(pc: usize) -> &'static str {
+    if FLATS.load(Ordering::Relaxed) {
+        NOTE_FLAT[pc % 12]
+    } else {
+        NOTE_SHARP[pc % 12]
+    }
+}
+
+/// The other spelling of a black key (shown small under it), "" for white keys.
+fn alt_name(pc: usize) -> &'static str {
+    if !is_black(pc % 12) {
+        ""
+    } else if FLATS.load(Ordering::Relaxed) {
+        NOTE_SHARP[pc % 12]
+    } else {
+        NOTE_FLAT[pc % 12]
+    }
+}
 const HIST: usize = 220;
 const BASE_W: f32 = 900.0;
 const BASE_H: f32 = 670.0;
 
-pub const PRESETS: [&str; 28] = [
+pub const PRESETS: [&str; 29] = [
     "Init (Major, 50 ms)",
     "Natural Correction",
     "Transparent Pop",
@@ -56,16 +78,19 @@ pub const PRESETS: [&str; 28] = [
     "Telephone Singer",
     "Whisper Child",
     "Formant Lab (LPC +3)",
+    "ULTRA Hard Steps",
 ];
 
-const PRESET_CATS: [&str; 28] = [
+const PRESET_CATS: [&str; 29] = [
     "Natural", "Natural", "Natural", "Natural", "Hard Tune", "Hard Tune", "Hard Tune", "Robot / FX", "Gender", "Gender", "Vibrato", "MIDI",
-    "Anime", "Anime", "Anime", "Anime", "Gender", "Gender", "Choir / Harmony", "Choir / Harmony", "Choir / Harmony", "Choir / Harmony", "Choir / Harmony", "Robot / FX", "Vibrato", "Robot / FX", "Gender", "Robot / FX",
+    "Anime", "Anime", "Anime", "Anime", "Gender", "Gender", "Choir / Harmony", "Choir / Harmony", "Choir / Harmony", "Choir / Harmony", "Choir / Harmony", "Robot / FX", "Vibrato", "Robot / FX", "Gender", "Robot / FX", "Hard Tune",
 ];
 
 struct Gui {
     det: VecDeque<f32>,
     cor: VecDeque<f32>,
+    raw_d: [f32; 3], // last raw readings, the display shows their median (steady lines)
+    raw_c: [f32; 3],
     last_push: Instant,
     centre: f32,
     last_det: f32,
@@ -84,7 +109,7 @@ struct Gui {
 }
 
 fn midi_name(m: i32) -> String {
-    format!("{}{}", NOTE_NAMES[m.rem_euclid(12) as usize], m.div_euclid(12) - 1)
+    format!("{}{}", note_name(m.rem_euclid(12) as usize), m.div_euclid(12) - 1)
 }
 
 fn is_black(pc: usize) -> bool {
@@ -162,6 +187,8 @@ fn apply_preset(setter: &ParamSetter, p: &NyashkTuneParams, idx: usize) {
     reset(setter, &p.ftilt);
     reset(setter, &p.ffollow);
     reset(setter, &p.tracking);
+    reset(setter, &p.ultra_on);
+    reset(setter, &p.ultra);
     reset(setter, &p.vib_shape);
     reset(setter, &p.air);
     reset(setter, &p.drive);
@@ -415,6 +442,13 @@ fn apply_preset(setter: &ParamSetter, p: &NyashkTuneParams, idx: usize) {
             set_f(setter, &p.retune, 40.0);
             set_e(setter, &p.fmode, FormantAlgo::Lpc);
             set_f(setter, &p.formant, 3.0);
+        }
+        28 => {
+            // ULTRA: MIDI-like note steps
+            set_b(setter, &p.ultra_on, true);
+            set_f(setter, &p.ultra, 100.0);
+            set_f(setter, &p.retune, 0.0);
+            set_f(setter, &p.transition, 0.0);
         }
         _ => {}
     }
@@ -827,6 +861,8 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
     let state = Gui {
         det: VecDeque::from(vec![f32::NAN; HIST]),
         cor: VecDeque::from(vec![f32::NAN; HIST]),
+        raw_d: [f32::NAN; 3],
+        raw_c: [f32::NAN; 3],
         last_push: Instant::now(),
         centre: 60.0,
         last_det: 0.0,
@@ -877,6 +913,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
         move |ctx, setter, st| {
             ctx.request_repaint_after(Duration::from_millis(33));
             let p = &*params;
+            FLATS.store(p.flats.load(Ordering::Relaxed) != 0, Ordering::Relaxed);
 
             // ---- history of detected / corrected pitch
             if st.last_push.elapsed() >= Duration::from_millis(33) {
@@ -901,6 +938,19 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 if !st.centre.is_finite() {
                     st.centre = 60.0;
                 }
+                // median of the last 3 readings: removes single-frame spikes, keeps real moves and gaps
+                let med = |r: &mut [f32; 3], v: f32| -> f32 {
+                    r.rotate_left(1);
+                    r[2] = v;
+                    if v.is_nan() {
+                        return f32::NAN;
+                    }
+                    let mut k: Vec<f32> = r.iter().copied().filter(|x| !x.is_nan()).collect();
+                    k.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    if k.len() == 2 { 0.5 * (k[0] + k[1]) } else { k[k.len() / 2] }
+                };
+                let d = med(&mut st.raw_d, d);
+                let c = med(&mut st.raw_c, c);
                 st.det.pop_front();
                 st.det.push_back(d);
                 st.cor.pop_front();
@@ -1066,7 +1116,23 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     }
                 }
                 painter.text(Pos2::new(o.x + 376.0, o.y + 31.0), Align2::LEFT_CENTER, "KEY", mono(10.0), DIM);
-                enum_combo(ui, setter, &p.key, "key", rect(402.0, 17.0, 60.0, 28.0));
+                {
+                    // key list in the chosen spelling; black keys show both names in the list
+                    let idx = p.key.value().to_index();
+                    ui.allocate_new_ui(UiBuilder::new().max_rect(rect(402.0, 17.0, 60.0, 28.0)), |ui| {
+                        egui::ComboBox::from_id_salt("key")
+                            .width(38.0)
+                            .selected_text(egui::RichText::new(note_name(idx)).font(mono(12.0)))
+                            .show_ui(ui, |ui| {
+                                for i in 0..12 {
+                                    let label = if alt_name(i).is_empty() { note_name(i).to_string() } else { format!("{} / {}", note_name(i), alt_name(i)) };
+                                    if ui.selectable_label(i == idx, egui::RichText::new(label).font(mono(12.0))).clicked() {
+                                        set_e(setter, &p.key, crate::Key::from_index(i));
+                                    }
+                                }
+                            });
+                    });
+                }
                 painter.text(Pos2::new(o.x + 468.0, o.y + 31.0), Align2::LEFT_CENTER, "SCALE", mono(10.0), DIM);
                 enum_combo(ui, setter, &p.scale, "scale", rect(510.0, 17.0, 116.0, 28.0));
                 if pill(ui, rect(634.0, 18.0, 68.0, 26.0), "BYPASS", p.bypass.value()) {
@@ -1129,6 +1195,19 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     clip.text(Pos2::new(disp.right() - 12.0, disp.top() + 18.0), Align2::RIGHT_CENTER, info, mono(17.0), WHITE);
                     clip.text(Pos2::new(disp.right() - 12.0, disp.top() + 38.0), Align2::RIGHT_CENTER, "output", mono(10.0), WHITE);
                     clip.text(Pos2::new(disp.right() - 64.0, disp.top() + 38.0), Align2::RIGHT_CENTER, "input", mono(10.0), MID);
+                    if p.ultra_on.value() && !p.bypass.value() {
+                        clip.text(Pos2::new(disp.right() - 12.0, disp.top() + 58.0), Align2::RIGHT_CENTER, format!("ULTRA {:.0}%", p.ultra.value()), mono(10.0), WHITE);
+                    }
+                }
+                // sharps / flats naming
+                let fl = p.flats.load(Ordering::Relaxed) != 0;
+                let sr = Rect::from_min_size(Pos2::new(disp.right() - 82.0, disp.bottom() - 30.0), Vec2::new(34.0, 22.0));
+                let fr = Rect::from_min_size(Pos2::new(disp.right() - 44.0, disp.bottom() - 30.0), Vec2::new(34.0, 22.0));
+                if pill(ui, sr, "♯", !fl) {
+                    p.flats.store(0, Ordering::Relaxed);
+                }
+                if pill(ui, fr, "♭", fl) {
+                    p.flats.store(1, Ordering::Relaxed);
                 }
 
                 // ---- note strip (click: note on/off, right-click: BYPASS = sung as it is)
@@ -1145,7 +1224,12 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     let fill = if on { WHITE } else if is_black(i) { BG } else { PANEL };
                     painter.rect_filled(r, CornerRadius::same(6), fill.gamma_multiply(a));
                     painter.rect_stroke(r, CornerRadius::same(6), Stroke::new(1.0_f32, if on { WHITE } else if resp.hovered() { DIM } else { LINE }), StrokeKind::Inside);
-                    painter.text(r.center() - Vec2::new(0.0, if is_byp { 4.0 } else { 0.0 }), Align2::CENTER_CENTER, NOTE_NAMES[i], mono(12.0), if on { Color32::BLACK } else { DIM });
+                    let alt = alt_name(i);
+                    let up = if is_byp || !alt.is_empty() { 5.0 } else { 0.0 };
+                    painter.text(r.center() - Vec2::new(0.0, up), Align2::CENTER_CENTER, note_name(i), mono(12.5), if on { Color32::BLACK } else { DIM });
+                    if !alt.is_empty() && !is_byp {
+                        painter.text(r.center() + Vec2::new(0.0, 9.0), Align2::CENTER_CENTER, alt, mono(9.0), if on { Color32::from_gray(90) } else { DIM.gamma_multiply(0.7) });
+                    }
                     if is_byp {
                         painter.text(r.center() + Vec2::new(0.0, 10.0), Align2::CENTER_CENTER, "BYP", mono(8.0), if on { Color32::BLACK } else { WHITE });
                     }
@@ -1226,10 +1310,15 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     knob(ui, setter, &p.nat_vib, "Nat. Vibrato", c[5], "Keeps the singer's own vibrato, only the centre pitch is corrected.", false);
 
                     let g2 = group(ui, 608.0, row1, 278.0, "02", "TRACKING");
-                    let c = cells(g2, 3);
+                    let c = cells(g2, 4);
                     knob(ui, setter, &p.tracking, "Tracking", c[0], "How reluctantly the tuner jumps to another note. Low = follows quick note changes, high = stays on a note until you clearly leave it.", false);
                     knob(ui, setter, &p.gate, "Gate", c[1], "Below this level the signal passes through untuned.", false);
                     knob(ui, setter, &p.ref_a, "Ref A4", c[2], "", false);
+                    let ul = p.ultra_on.value();
+                    knob(ui, setter, &p.ultra, "Ultra", c[3], "ULTRA amount. At 100 % the voice sits exactly on the note and jumps to the next one instantly, like a MIDI note: no glide, no vibrato, no drift. Lower = some of the normal settings come back. Switch ULTRA on / off with the button above.", false);
+                    if pill(ui, Rect::from_min_size(Pos2::new(g2.right() - 66.0, g2.top() + 6.0), Vec2::new(56.0, 18.0)), "ULTRA", ul) {
+                        set_b(setter, &p.ultra_on, !ul);
+                    }
 
                     let g3 = group(ui, 14.0, row2, 430.0, "03", "VIBRATO");
                     let c = cells(g3, 3);

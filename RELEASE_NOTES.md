@@ -1,3 +1,12 @@
+## NyashkTune v1.1.0
+
+### New in this build
+- **ULTRA**: a switch and an amount knob (TRACKING panel). At 100 % the voice sits exactly on the note and steps to the next one instantly, like a MIDI note: no glide, no vibrato, no drift, even with slow Retune settings. Switch it off and everything is as before. New preset *ULTRA Hard Steps*.
+- **Steadier tracking**: the note is chosen from a lightly smoothed pitch and has to hold for a moment before the tuner moves, so a voice sitting between two notes, a crack or a scoop no longer flickers between neighbours. Big jumps are still taken at once.
+- **Flats**: every black key shows both spellings (C♯ / D♭); the ♯ / ♭ switch on the pitch display chooses which one is used everywhere (display, note names, key list). The host also shows "C# / Db".
+- Steadier pitch display (the lines are median-filtered, single-frame spikes are gone).
+- **Fixed:** *Voice 1 / 2 On* shared a parameter ID with *Custom Note C / C♯*, so the host and saved projects mixed the two up (found by the Steinberg VST3 validator). The voice switches have their own ID now; in projects saved with older versions the two voice switches start off.
+
 ## NyashkTune v1.0.1
 
 NyashkTune is a realtime vocal pitch correction (autotune) VST3 plugin.

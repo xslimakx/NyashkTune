@@ -19,25 +19,25 @@ mod editor;
 pub enum Key {
     #[name = "C"]
     C,
-    #[name = "C#"]
+    #[name = "C# / Db"]
     Cs,
     #[name = "D"]
     D,
-    #[name = "D#"]
+    #[name = "D# / Eb"]
     Ds,
     #[name = "E"]
     E,
     #[name = "F"]
     F,
-    #[name = "F#"]
+    #[name = "F# / Gb"]
     Fs,
     #[name = "G"]
     G,
-    #[name = "G#"]
+    #[name = "G# / Ab"]
     Gs,
     #[name = "A"]
     A,
-    #[name = "A#"]
+    #[name = "A# / Bb"]
     As,
     #[name = "B"]
     B,
@@ -147,7 +147,7 @@ pub struct NoteParam {
 /// One extra voice (harmony / double) sung next to the corrected lead.
 #[derive(Params)]
 pub struct VoiceParam {
-    #[id = "on"]
+    #[id = "von"]
     pub on: BoolParam,
     #[id = "int"]
     pub interval: FloatParam,
@@ -241,6 +241,14 @@ pub struct NyashkTuneParams {
     pub ffollow: FloatParam,
     #[id = "tracking"]
     pub tracking: FloatParam,
+    /// ULTRA: MIDI-like hard stepping between notes (switch + amount)
+    #[id = "ultraon"]
+    pub ultra_on: BoolParam,
+    #[id = "ultra"]
+    pub ultra: FloatParam,
+    /// GUI naming: show flats (Db, Eb ...) instead of sharps; not automatable
+    #[persist = "flats"]
+    pub flats: AtomicU32,
     #[id = "vibshape"]
     pub vib_shape: EnumParam<VibShape>,
     #[id = "air"]
@@ -285,7 +293,7 @@ impl Default for NoteParam {
 
 impl Default for NyashkTuneParams {
     fn default() -> Self {
-        const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+        const NOTE_NAMES: [&str; 12] = ["C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb", "G", "G#/Ab", "A", "A#/Bb", "B"];
         let notes: [NoteParam; 12] = std::array::from_fn(|i| NoteParam {
             on: BoolParam::new(format!("Custom Note {}", NOTE_NAMES[i]), true),
         });
@@ -333,6 +341,9 @@ impl Default for NyashkTuneParams {
             ftilt: FloatParam::new("Formant Tilt", 0.0, lin(-100.0, 100.0)).with_unit(" %").with_step_size(1.0),
             ffollow: FloatParam::new("Formant Follow", 100.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
             tracking: FloatParam::new("Tracking", 22.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
+            ultra_on: BoolParam::new("Ultra", false),
+            ultra: FloatParam::new("Ultra Amount", 100.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
+            flats: AtomicU32::new(0),
             vib_shape: EnumParam::new("Vibrato Shape", VibShape::Sine),
             air: FloatParam::new("Air", 0.0, lin(-6.0, 12.0)).with_unit(" dB").with_step_size(0.1),
             drive: FloatParam::new("Drive", 0.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
@@ -410,6 +421,7 @@ impl NyashkTuneParams {
             formant_tilt: self.ftilt.value() / 100.0,
             formant_follow: self.ffollow.value() / 100.0,
             tracking: self.tracking.value() / 100.0,
+            ultra: if self.ultra_on.value() { self.ultra.value() / 100.0 } else { 0.0 },
             bypass_mask: (self.note_bypass.load(Ordering::Relaxed) & 0xFFF) as u16,
             vib_shape: self.vib_shape.value() as usize,
             air_db: self.air.value(),
@@ -554,6 +566,7 @@ impl Plugin for NyashkTune {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        demo_voice(buffer);
         let Some(eng) = self.engine.as_mut() else {
             return ProcessStatus::Normal;
         };
@@ -625,5 +638,37 @@ mod tests {
         assert!((p.transpose.preview_plain(n) + 5.0).abs() < 0.1);
         let n = p.ref_a.string_to_normalized_value("432").unwrap();
         assert!((p.ref_a.preview_plain(n) - 432.0).abs() < 0.5);
+    }
+}
+
+/// Developer helper for screenshots: with `NYASHK_DEMO=1` the standalone build sings a short melody
+/// (vowel with vibrato, slightly out of tune) instead of using the input.
+fn demo_voice(buffer: &mut Buffer) {
+    use std::sync::Mutex;
+    static ST: Mutex<Option<(bool, u64, f64, f64, f64)>> = Mutex::new(None);
+    let mut g = ST.lock().unwrap();
+    let st = g.get_or_insert_with(|| (std::env::var("NYASHK_DEMO").is_ok(), 0, 0.0, 0.0, 0.0));
+    if !st.0 {
+        return;
+    }
+    let fs = 48000.0f64;
+    let melody = [57.0f64, 60.0, 62.0, 60.0, 64.0, 62.0, 60.0, 57.0];
+    for mut frame in buffer.iter_samples() {
+        let t = st.1 as f64 / fs;
+        st.1 += 1;
+        let k = (t / 0.6) as usize;
+        let gap = (t / 0.6).fract() > 0.88;
+        let m = melody[k % melody.len()] + 0.3 + 0.35 * (2.0 * std::f64::consts::PI * 5.5 * t).sin();
+        let f0 = 440.0 * 2f64.powf((m - 69.0) / 12.0);
+        st.2 = (st.2 + f0 / fs) % 1.0;
+        let src = if st.2 < 0.05 { 1.0 } else { -0.05 };
+        let (r, th) = (0.985, 2.0 * std::f64::consts::PI * 750.0 / fs);
+        let y = src * 0.1 + 2.0 * r * th.cos() * st.3 - r * r * st.4;
+        st.4 = st.3;
+        st.3 = y;
+        let v = if gap { 0.0 } else { (y * 1.2) as f32 };
+        for s in frame.iter_mut() {
+            *s = v;
+        }
     }
 }

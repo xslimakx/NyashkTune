@@ -31,6 +31,8 @@ Realtime vocal pitch correction, from transparent, natural-sounding tuning to th
 | **Resynthesis** | PSOLA on pitch marks, mono/stereo |
 | **Scales** | 16 scales + **Custom** (click notes C…B), key, Ref A4 (415–466 Hz) |
 | **Per-note BYPASS** | Right-click a note: it is allowed as a target but sung exactly as it is (blue-note / slide friendly) |
+| **ULTRA** | Switch + amount: MIDI-like hard steps between notes, dead flat on the note (no glide, vibrato or drift). Off = normal behaviour |
+| **Note names** | Sharps and flats: every black key shows both, the ♯ / ♭ switch picks the spelling used everywhere |
 | **Character** | Retune Speed (0 = hard T-Pain), Note Transition, **LINK**, Amount, Flex-Tune, Humanize, Natural Vibrato, **Tracking** (how reluctantly it jumps to another note) |
 | **Vibrato** | Synthetic vibrato: Depth / Rate / Delay, shapes Sine / Triangle / Saw / Wander |
 | **MIDI Target** | Tunes to the notes you play on a MIDI keyboard |
@@ -40,7 +42,7 @@ Realtime vocal pitch correction, from transparent, natural-sounding tuning to th
 | **Voice range** | Generic, Bass, Baritone, Tenor, Alto, Mezzo-Soprano, Soprano, Instrument |
 | **Your presets** | **SAVE** stores every setting under your own name and category (any language / symbols) in the preset browser. Files: `~/.config/NyashkTune/presets` (Linux), `%APPDATA%\\NyashkTune\\presets` (Windows), `~/Library/Application Support/NyashkTune/presets` (macOS) - copy them to share |
 | **Switch off what you don't need** | the module switches on the tab bar - **FORMANT**, **VOICES** (master) and each voice **ON**, **COLOUR** (Air/Drive), **VIBRATO**: when off the stage is skipped completely (no CPU) - plain pitch correction only needs the TUNE tab |
-| **Other** | 28 presets (incl. **Anime Vocal**), full automation, state recall, resizable window |
+| **Other** | 29 presets (incl. **Anime Vocal**), full automation, state recall, resizable window |
 
 ### Preset browser
 

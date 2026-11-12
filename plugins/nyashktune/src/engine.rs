@@ -136,6 +136,9 @@ pub struct Params {
     pub formant_tilt: f32,   // -1..1, formant shift applied more to highs (+) or lows (-)
     pub formant_follow: f32, // 0..1, how much the formants follow the pitch correction when not preserved
     pub tracking: f32,       // 0..1, how reluctantly the tuner jumps to another note
+    /// 0..1 ULTRA amount (0 when ULTRA is switched off). 1 = MIDI-like: the output sits exactly on the
+    /// note and steps to the next one instantly, no glide, no vibrato, no drift.
+    pub ultra: f32,
     pub bypass_mask: u16,    // pitch classes that are left uncorrected
     pub vib_shape: usize,    // 0 sine, 1 triangle, 2 saw, 3 random
     pub air_db: f32,         // high shelf on the wet signal
@@ -179,6 +182,7 @@ impl Default for Params {
             formant_tilt: 0.0,
             formant_follow: 1.0,
             tracking: 0.22,
+            ultra: 0.0,
             bypass_mask: 0,
             vib_shape: 0,
             air_db: 0.0,
@@ -350,6 +354,9 @@ pub struct Engine {
     cur_note: i32,
     was_voiced: bool,
     transition: bool, // gliding towards a freshly selected note
+    cand_note: i32,   // a different note the pitch is moving to (must hold a moment before we switch)
+    cand_age: f64,
+    note_sm: f64,     // lightly smoothed pitch used only to *choose* the note (not to correct it)
 }
 
 #[inline]
@@ -420,6 +427,9 @@ impl Engine {
             cur_note: 60,
             was_voiced: false,
             transition: false,
+            cand_note: i32::MIN,
+            cand_age: 0.0,
+            note_sm: 60.0,
         };
         e.set_lowest_hz(lowest_hz);
         e
@@ -864,7 +874,7 @@ impl Engine {
         (self.allowed_pc >> pc) & 1 == 1
     }
 
-    fn pick_note(&mut self, basis: f64) -> bool {
+    fn pick_note(&mut self, basis: f64, dt: f64) -> bool {
         let base = basis.floor() as i32;
         let mut best = None;
         let mut bd = 1e9;
@@ -881,18 +891,36 @@ impl Engine {
             self.have_note = false;
             return false;
         };
-        let hyst = 0.05 + 0.45 * (self.p.tracking as f64).clamp(0.0, 1.0);
+        let tr = (self.p.tracking as f64).clamp(0.0, 1.0);
+        let u = (self.p.ultra as f64).clamp(0.0, 1.0);
+        let hyst = 0.08 + 0.42 * tr + 0.10 * u;
+        // a new note must hold for a moment before we jump to it: no flicker between neighbours
+        // on scoops, cracks or a voice sitting right between two notes
+        let dwell = 0.010 + 0.030 * tr + 0.006 * u;
         if self.have_note && self.is_allowed(self.cur_note) {
             if best != self.cur_note && (basis - self.cur_note as f64).abs() > bd + hyst {
-                self.cur_note = best;
-                self.note_age = 0.0;
-                self.transition = true;
+                if self.cand_note == best {
+                    self.cand_age += dt;
+                } else {
+                    self.cand_note = best;
+                    self.cand_age = 0.0;
+                }
+                if self.cand_age >= dwell {
+                    self.cur_note = best;
+                    self.note_age = 0.0;
+                    self.transition = true;
+                    self.cand_note = i32::MIN;
+                }
+            } else {
+                self.cand_note = i32::MIN;
+                self.cand_age = 0.0;
             }
         } else {
             self.cur_note = best;
             self.have_note = true;
             self.note_age = 0.0;
             self.transition = true; // a new note after a pause counts as a note transition
+            self.cand_note = i32::MIN;
         }
         true
     }
@@ -913,6 +941,7 @@ impl Engine {
         let midi = 69.0 + 12.0 * (f0 / self.p.ref_a as f64).log2();
         if !self.was_voiced {
             self.slow_midi = midi;
+            self.note_sm = midi;
             self.have_note = false;
             self.note_age = 0.0;
             self.transition = true;
@@ -920,15 +949,26 @@ impl Engine {
         }
         self.slow_midi += (midi - self.slow_midi) * (1.0 - (-dt / 0.12).exp());
 
-        let nv = (self.p.natural_vib as f64).clamp(0.0, 1.0);
+        // ULTRA pulls every "soft" control towards hard MIDI-like stepping
+        let u = (self.p.ultra as f64).clamp(0.0, 1.0);
+        let nv = (self.p.natural_vib as f64).clamp(0.0, 1.0) * (1.0 - u);
         let basis = midi + (self.slow_midi - midi) * nv;
 
+        // the note is chosen from a lightly smoothed pitch (vibrato and jitter do not flip it to a
+        // neighbour); a clear jump of more than ~1.2 semitones is taken at once
+        let tau_n = 0.012 + 0.030 * (self.p.tracking as f64).clamp(0.0, 1.0) + 0.030 * u;
+        if (basis - self.note_sm).abs() > 1.2 {
+            self.note_sm = basis;
+        } else {
+            self.note_sm += (basis - self.note_sm) * (1.0 - (-dt / tau_n).exp());
+        }
         let mut err = 0.0;
-        if self.pick_note(basis) {
+        if self.pick_note(self.note_sm, dt) {
             err = self.cur_note as f64 - basis;
-            let fl = self.p.flex_cents as f64 / 100.0;
+            let fl = self.p.flex_cents as f64 / 100.0 * (1.0 - u);
             err = if err > fl { err - fl } else if err < -fl { err + fl } else { 0.0 };
-            err *= (self.p.amount as f64).clamp(0.0, 1.0);
+            let amount = (self.p.amount as f64).clamp(0.0, 1.0);
+            err *= amount + (1.0 - amount) * u;
             if (self.p.bypass_mask >> (self.cur_note.rem_euclid(12) as u32)) & 1 == 1 {
                 err = 0.0; // this note is flagged BYPASS: sing it as it is
             }
@@ -938,8 +978,9 @@ impl Engine {
         // Retune Speed for settling inside a note
         let mut tau = if self.transition { self.p.transition_ms } else { self.p.retune_ms } as f64 / 1000.0;
         if self.p.humanize > 0.0 {
-            tau *= 1.0 + self.p.humanize as f64 * 4.0 * (1.0 - (err.abs() / 0.5).min(1.0));
+            tau *= 1.0 + self.p.humanize as f64 * (1.0 - u) * 4.0 * (1.0 - (err.abs() / 0.5).min(1.0));
         }
+        tau *= (1.0 - u) * (1.0 - u);
         if tau < 0.0005 {
             self.corr_sm = err;
         } else {
@@ -1384,6 +1425,157 @@ mod fuzz_tests {
                 let inpk = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
                 assert!(peak < 8.0 * inpk.max(0.1), "peak {peak} input peak {inpk} (fs {fs}, nch {nch})");
             }
+        }
+    }
+
+
+    /// Vowel-like test voice following a pitch curve (MIDI note per sample).
+    fn sung(fs: f64, midi: impl Fn(f64) -> f64, secs: f64) -> Vec<f32> {
+        let n = (fs * secs) as usize;
+        let (mut ph, mut y1, mut y2) = (0.0f64, 0.0f64, 0.0f64);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / fs;
+            let f0 = 440.0 * 2f64.powf((midi(t) - 69.0) / 12.0);
+            ph = (ph + f0 / fs) % 1.0;
+            let src = if ph < 0.05 { 1.0 } else { -0.05 };
+            let r = 0.985;
+            let th = 2.0 * PI * 750.0 / fs;
+            let y = src * 0.1 + 2.0 * r * th.cos() * y1 - r * r * y2;
+            y2 = y1;
+            y1 = y;
+            out.push((y * 2.0) as f32);
+        }
+        let pk = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        out.iter().map(|v| v * 0.4 / pk).collect()
+    }
+
+    /// Short-time pitch (MIDI) of `x` around sample `c` by normalised autocorrelation, parabolic peak.
+    fn pitch_at(x: &[f32], c: usize, fs: f64) -> f64 {
+        let w = 1536usize;
+        let a = c - w / 2;
+        let (lo, hi) = ((fs / 700.0) as usize, (fs / 120.0) as usize);
+        let ac = |lag: usize| -> f64 {
+            let (mut s, mut e0, mut e1) = (0.0f64, 0.0f64, 0.0f64);
+            for i in a..a + w {
+                s += x[i] as f64 * x[i + lag] as f64;
+                e0 += (x[i] as f64).powi(2);
+                e1 += (x[i + lag] as f64).powi(2);
+            }
+            s / (e0 * e1).sqrt().max(1e-12)
+        };
+        let vals: Vec<f64> = (lo..=hi + 1).map(ac).collect();
+        let mut best = 1;
+        for k in 1..vals.len() - 1 {
+            if vals[k] > vals[best] {
+                best = k;
+            }
+        }
+        // prefer the shortest lag that is nearly as good (no octave-down errors)
+        for k in 1..vals.len() - 1 {
+            if vals[k] > 0.9 * vals[best] && vals[k] >= vals[k - 1] && vals[k] >= vals[k + 1] {
+                best = k;
+                break;
+            }
+        }
+        let (y0, y1, y2) = (vals[best - 1], vals[best], vals[best + 1]);
+        let den = y0 - 2.0 * y1 + y2;
+        let sh = if den.abs() > 1e-12 { (0.5 * (y0 - y2) / den).clamp(-1.0, 1.0) } else { 0.0 };
+        let lag = (lo + best) as f64 + sh;
+        69.0 + 12.0 * (fs / lag / 440.0).log2()
+    }
+
+    fn run_engine(fs: f64, x: &[f32], p: &Params) -> (Vec<f32>, usize) {
+        let mut e = Engine::new(fs, 70.0);
+        let lat = e.latency_samples() as usize;
+        let mut out = Vec::with_capacity(x.len());
+        for ch in x.chunks(128) {
+            e.set_params(p);
+            for &s in ch {
+                out.push(e.process_frame([s, s], 1)[0]);
+            }
+        }
+        (out, lat)
+    }
+
+    /// ULTRA at 100 %: a wobbly, vibrato-heavy voice comes out dead flat on the note,
+    /// and a note change becomes an instant step - even with slow Retune / Transition settings.
+    #[test]
+    fn ultra_is_flat_and_steps_instantly() {
+        let fs = 48000.0;
+        // A3 with 45 cent vibrato + slow 25 cent drift, then at 1.5 s a jump to C4 with the same wobble
+        let curve = |t: f64| {
+            let base = if t < 1.5 { 57.0 } else { 60.0 };
+            base + 0.45 * (2.0 * PI * 5.5 * t).sin() + 0.25 * (2.0 * PI * 0.7 * t).sin()
+        };
+        let x = sung(fs, curve, 3.0);
+        let mut p = Params::default();
+        p.scale = 0;
+        p.retune_ms = 250.0;
+        p.transition_ms = 250.0;
+        p.natural_vib = 1.0;
+        let dev = |out: &[f32], lat: usize, from: f64, to: f64, note: f64| -> (f64, f64) {
+            let (mut max, mut sum, mut n) = (0.0f64, 0.0f64, 0);
+            let mut t = from;
+            while t < to {
+                let m = pitch_at(out, (t * fs) as usize + lat, fs);
+                let d = (m - note).abs();
+                max = max.max(d);
+                sum += d;
+                n += 1;
+                t += 0.01;
+            }
+            (max * 100.0, sum / n as f64 * 100.0)
+        };
+        p.ultra = 1.0;
+        let (u, lat) = run_engine(fs, &x, &p);
+        let (umax1, uavg1) = dev(&u, lat, 0.4, 1.4, 57.0);
+        let (umax2, uavg2) = dev(&u, lat, 1.6, 2.9, 60.0);
+        p.ultra = 0.0;
+        let (n, _) = run_engine(fs, &x, &p);
+        let (nmax, navg) = dev(&n, lat, 0.4, 1.4, 57.0);
+        println!("ULTRA: max {umax1:.1} c avg {uavg1:.1} c | after step max {umax2:.1} c avg {uavg2:.1} c | normal: max {nmax:.1} c avg {navg:.1} c");
+        assert!(umax1 < 12.0 && uavg1 < 4.0, "ULTRA not flat: max {umax1:.1} c avg {uavg1:.1} c");
+        assert!(umax2 < 12.0 && uavg2 < 4.0, "ULTRA not flat after the step: max {umax2:.1} avg {uavg2:.1}");
+        assert!(navg > 3.0 * uavg1, "normal mode should keep much more of the wobble");
+        // step: 60 ms after the input jumps, the output is already on C4
+        let m = pitch_at(&u, ((1.5 + 0.06) * fs) as usize + lat, fs);
+        assert!((m - 60.0).abs() < 0.15, "step too slow: {m:.2}");
+    }
+
+    /// A voice wobbling right between two notes must not flicker back and forth between them.
+    #[test]
+    fn note_choice_does_not_flicker() {
+        let fs = 48000.0;
+        let mut seed = 5u32;
+        let jit: Vec<f64> = (0..400).map(|_| (xorshift(&mut seed) as f64 - 0.5) * 0.22).collect();
+        // sits at 57.5 (between A3 and A#3) with fast random jitter of +-11 cents
+        let x = sung(fs, |t| 57.5 + jit[((t * 120.0) as usize).min(399)], 3.0);
+        for (ultra, tracking) in [(0.0f32, 0.0f32), (0.0, 0.22), (1.0, 0.22)] {
+            let mut e = Engine::new(fs, 70.0);
+            let mut p = Params::default();
+            p.scale = 0;
+            p.ultra = ultra;
+            p.tracking = tracking;
+            let mut switches = 0;
+            let mut last = 0.0f32;
+            for (i, ch) in x.chunks(128).enumerate() {
+                e.set_params(&p);
+                for &s in ch {
+                    e.process_frame([s, s], 1);
+                }
+                let t = e.meters.target;
+                if i as f64 * 128.0 / fs > 0.3 && t > 0.0 {
+                    if last > 0.0 && t != last {
+                        switches += 1;
+                    }
+                    last = t;
+                }
+            }
+            println!("ultra {ultra} tracking {tracking}: {switches} note switches in 2.7 s");
+            // Tracking 0 is asked to follow every quick move; everything else must stay put
+            let limit = if tracking == 0.0 { 10 } else { 3 };
+            assert!(switches <= limit, "flicker: {switches} switches (ultra {ultra}, tracking {tracking})");
         }
     }
 
