@@ -172,12 +172,12 @@ impl VoiceParam {
         let (iv, lv, pn) = defaults[i.min(1)];
         Self {
             on: BoolParam::new(format!("Voice {n} On"), false),
-            interval: FloatParam::new(format!("Voice {n} Interval"), iv, lin(-24.0, 24.0)).with_unit(" st").with_step_size(1.0),
+            interval: FloatParam::new(format!("Voice {n} Interval"), iv, lin(-24.0, 24.0)).with_unit(" st").with_step_size(1.0).with_value_to_string(Arc::new(|v| format!("{}", v.round() as i32 + 0))),
             snap: BoolParam::new(format!("Voice {n} Scale-Aware"), true),
-            level: FloatParam::new(format!("Voice {n} Level"), lv, lin(-30.0, 6.0)).with_unit(" dB").with_step_size(0.1),
+            level: FloatParam::new(format!("Voice {n} Level"), lv, lin(-30.0, 6.0)).with_unit(" dB").with_step_size(0.1).with_value_to_string(Arc::new(|v| format!("{:.1}", (v * 10.0).round() / 10.0 + 0.0))),
             pan: FloatParam::new(format!("Voice {n} Pan"), pn, lin(-100.0, 100.0)).with_unit(" %").with_step_size(1.0),
             detune: FloatParam::new(format!("Voice {n} Detune"), 0.0, lin(-50.0, 50.0)).with_unit(" c").with_step_size(0.1),
-            formant: FloatParam::new(format!("Voice {n} Formant"), 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(0.1),
+            formant: FloatParam::new(format!("Voice {n} Formant"), 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(0.1).with_value_to_string(Arc::new(|v| format!("{:.1}", (v * 10.0).round() / 10.0 + 0.0))),
             delay: FloatParam::new(format!("Voice {n} Delay"), 0.0, lin(0.0, 60.0)).with_unit(" ms").with_step_size(0.1),
         }
     }
@@ -330,9 +330,9 @@ impl Default for NyashkTuneParams {
             humanize: FloatParam::new("Humanize", 0.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(0.1),
             nat_vib: FloatParam::new("Natural Vibrato", 0.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(0.1),
 
-            transpose: FloatParam::new("Transpose", 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(1.0),
+            transpose: FloatParam::new("Transpose", 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(1.0).with_value_to_string(Arc::new(|v| format!("{}", v.round() as i32 + 0))),
             fine: FloatParam::new("Detune", 0.0, lin(-100.0, 100.0)).with_unit(" c").with_step_size(0.1),
-            formant: FloatParam::new("Formant Shift", 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(0.1),
+            formant: FloatParam::new("Formant Shift", 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(0.1).with_value_to_string(Arc::new(|v| format!("{:.1}", (v * 10.0).round() / 10.0 + 0.0))),
             keep_formants: BoolParam::new("Keep Formants", true),
             formant_on: BoolParam::new("Formant On", true),
             voices_on: BoolParam::new("Voices On", true),
@@ -345,7 +345,7 @@ impl Default for NyashkTuneParams {
             ultra: FloatParam::new("Ultra Amount", 100.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
             flats: AtomicU32::new(0),
             vib_shape: EnumParam::new("Vibrato Shape", VibShape::Sine),
-            air: FloatParam::new("Air", 0.0, lin(-6.0, 12.0)).with_unit(" dB").with_step_size(0.1),
+            air: FloatParam::new("Air", 0.0, lin(-6.0, 12.0)).with_unit(" dB").with_step_size(0.1).with_value_to_string(Arc::new(|v| format!("{:.1}", (v * 10.0).round() / 10.0 + 0.0))),
             drive: FloatParam::new("Drive", 0.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
             voices: std::array::from_fn(VoiceParam::new),
 

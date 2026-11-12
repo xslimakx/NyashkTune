@@ -770,7 +770,7 @@ fn knob_id<P: Param>(ui: &mut Ui, setter: &ParamSetter, p: &P, label: &str, id: 
 
     // value + label (click the value box to type a number)
     let val = p.normalized_value_to_string(norm, true);
-    let vr = Rect::from_center_size(Pos2::new(cell.center().x, c.y + r + 14.0), Vec2::new(cell.width().min(84.0), 18.0));
+    let vr = Rect::from_center_size(Pos2::new(cell.center().x, c.y + r + 14.0), Vec2::new((cell.width() - 6.0).min(84.0), 18.0));
     let edit_id = egui::Id::new(("knob_edit", id));
     let editing: Option<String> = ui.data(|d| d.get_temp::<String>(edit_id));
     painter_label(ui, cell, vr, label);
@@ -803,9 +803,15 @@ fn knob_id<P: Param>(ui: &mut Ui, setter: &ParamSetter, p: &P, label: &str, id: 
         let vresp = ui.allocate_rect(vr, Sense::click()).on_hover_text("Click to type a value");
         let painter = ui.painter();
         painter.rect_stroke(vr, CornerRadius::same(4), Stroke::new(1.0_f32, if vresp.hovered() { DIM } else { LINE }), StrokeKind::Inside);
-        painter.text(vr.center(), Align2::CENTER_CENTER, &val, mono(11.0), WHITE);
+        let gw = ui.fonts(|f| f.layout_no_wrap(val.clone(), mono(11.0), WHITE).size().x);
+        let size = if gw > vr.width() - 6.0 { (11.0 * (vr.width() - 6.0) / gw).max(7.5) } else { 11.0 };
+        painter.text(vr.center(), Align2::CENTER_CENTER, &val, mono(size), WHITE);
         if vresp.clicked() {
-            let plain = val.trim().split(' ').next().unwrap_or("").to_string();
+            // start editing with the bare number, unless the number alone would mean something
+            // else (e.g. "1.03 s" -> "1.03" would be read as milliseconds): then keep the full text
+            let first = val.trim().split(' ').next().unwrap_or("").to_string();
+            let same = p.string_to_normalized_value(&first).map(|m| p.normalized_value_to_string(m, true)).as_deref() == Some(val.as_str());
+            let plain = if same { first } else { val.trim().to_string() };
             ui.data_mut(|d| d.insert_temp(edit_id, plain));
         }
     }
@@ -1158,7 +1164,10 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                         let allowed = !midi_mode && (mask >> pc) & 1 == 1;
                         let y = y_of(m as f32);
                         clip.hline(disp.left() + 48.0..=disp.right() - 8.0, y, Stroke::new(1.0_f32, if allowed { WHITE.gamma_multiply(0.28) } else { WHITE.gamma_multiply(0.05) }));
-                        clip.text(Pos2::new(disp.left() + 8.0, y), Align2::LEFT_CENTER, midi_name(m), mono(10.5), if allowed { WHITE } else { DIM.gamma_multiply(0.7) });
+                        // names only where they fit completely (no half-cut labels at the edges)
+                        if y > disp.top() + 8.0 && y < disp.bottom() - 8.0 {
+                            clip.text(Pos2::new(disp.left() + 8.0, y), Align2::LEFT_CENTER, midi_name(m), mono(10.5), if allowed { WHITE } else { DIM.gamma_multiply(0.7) });
+                        }
                     }
                     let line = |h: &VecDeque<f32>, col: Color32, w: f32| {
                         let x0 = disp.left() + 52.0;
@@ -1227,7 +1236,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     let up = if is_byp || !alt.is_empty() { 5.0 } else { 0.0 };
                     painter.text(r.center() - Vec2::new(0.0, up), Align2::CENTER_CENTER, note_name(i), mono(12.5), if on { Color32::BLACK } else { DIM });
                     if !alt.is_empty() && !is_byp {
-                        painter.text(r.center() + Vec2::new(0.0, 9.0), Align2::CENTER_CENTER, alt, mono(9.0), if on { Color32::from_gray(90) } else { DIM.gamma_multiply(0.7) });
+                        painter.text(r.center() + Vec2::new(0.0, 9.0), Align2::CENTER_CENTER, alt, mono(9.0), if on { Color32::from_gray(80) } else { DIM });
                     }
                     if is_byp {
                         painter.text(r.center() + Vec2::new(0.0, 10.0), Align2::CENTER_CENTER, "BYP", mono(8.0), if on { Color32::BLACK } else { WHITE });

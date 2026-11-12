@@ -129,6 +129,11 @@ impl<'a> Window<'a> {
     }
 
     #[cfg(target_os = "linux")]
+    pub fn take_exposed(&self) -> bool {
+        self.window.take_exposed()
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn put_image_bgra_rect(&self, full_w: u32, x: u32, y: u32, w: u32, h: u32, data: &[u8]) {
         self.window.put_image_bgra_rect(full_w, x, y, w, h, data)
     }

@@ -101,6 +101,9 @@ pub(crate) struct WindowInner {
     mouse_cursor: Cell<MouseCursor>,
 
     pub(crate) close_requested: Cell<bool>,
+    /// NyashkTune: set when X discarded (part of) the window contents (Expose / MapNotify);
+    /// the CPU renderer then presents the whole frame instead of only what changed.
+    pub(crate) exposed: Cell<bool>,
 
     #[cfg(feature = "opengl")]
     gl_context: Option<GlContext>,
@@ -321,6 +324,7 @@ impl<'a> Window<'a> {
             mouse_cursor: Cell::new(MouseCursor::default()),
 
             close_requested: Cell::new(false),
+            exposed: Cell::new(true),
 
             #[cfg(feature = "opengl")]
             gl_context,
@@ -417,6 +421,11 @@ impl<'a> Window<'a> {
     }
 
     /// NyashkTune: present a BGRA (little-endian 0xAARRGGBB) image at the top-left of the window.
+    /// NyashkTune: true once after the window contents were lost (exposed / remapped).
+    pub fn take_exposed(&self) -> bool {
+        self.inner.exposed.replace(false)
+    }
+
     /// Uploads only the sub-rectangle `(x, y, w, h)` of a full BGRA frame `data` whose stride is `full_w` pixels.
     pub fn put_image_bgra_rect(&self, full_w: u32, x: u32, y: u32, w: u32, h: u32, data: &[u8]) {
         use x11rb::protocol::xproto::ImageFormat;

@@ -196,6 +196,10 @@ impl EventLoop {
                 }
             }
 
+            XEvent::Expose(_) | XEvent::MapNotify(_) => {
+                self.window.exposed.set(true);
+            }
+
             XEvent::ConfigureNotify(event) => {
                 let new_physical_size = PhySize::new(event.width as u32, event.height as u32);
 

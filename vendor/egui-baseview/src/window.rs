@@ -385,7 +385,21 @@ where
         }
 
         let now = Instant::now();
-        let do_repaint_now = if let Some(t) = self.repaint_after {
+        // A pass that uploads or frees textures must always be rendered: egui
+        // sends every texture delta exactly once, so skipping it would lose
+        // the texture for good (blank images after alt-tab / minimize).
+        let has_tex = !full_output.textures_delta.set.is_empty()
+            || !full_output.textures_delta.free.is_empty();
+        // After alt-tab / being covered, X throws the window contents away: draw everything again.
+        #[cfg(target_os = "linux")]
+        let exposed = window.take_exposed();
+        #[cfg(not(target_os = "linux"))]
+        let exposed = false;
+        #[cfg(target_os = "linux")]
+        if exposed {
+            self.renderer.force_redraw();
+        }
+        let do_repaint_now = has_tex || exposed || if let Some(t) = self.repaint_after {
             now >= t || viewport_output.repaint_delay.is_zero()
         } else {
             viewport_output.repaint_delay.is_zero()

@@ -15,8 +15,12 @@ pub use vulkan::GraphicsConfig;
 #[cfg(target_os = "linux")]
 pub struct Renderer {
     gpu: Option<vulkan::Renderer>,
+    /// Always present: draws when there is no GPU, and while the GPU draws it keeps a copy of
+    /// every texture, so a later fallback starts with all pictures (egui sends each only once).
     cpu: Option<software::Renderer>,
-    fails: u32,
+    /// consecutive skipped frames (minimised / hidden window, surface timeout) and crashes
+    skipped: u32,
+    crashes: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -32,9 +36,16 @@ impl Renderer {
                 Err(_) => baseview::nylog("Vulkan init panicked, using the CPU renderer"),
             }
         }
-        let cpu = if gpu.is_none() { Some(software::Renderer::new(window, Default::default())?) } else { None };
+        let cpu = Some(software::Renderer::new(window, Default::default())?);
         baseview::nylog(if gpu.is_some() { "renderer: Vulkan" } else { "renderer: CPU" });
-        Ok(Self { gpu, cpu, fails: 0 })
+        Ok(Self { gpu, cpu, skipped: 0, crashes: 0 })
+    }
+
+    /// The window contents were lost (exposed / remapped): present a full frame next time.
+    pub fn force_redraw(&mut self) {
+        if let Some(c) = self.cpu.as_mut() {
+            c.force_redraw();
+        }
     }
 
     pub fn max_texture_side(&self) -> usize {
@@ -54,23 +65,29 @@ impl Renderer {
         full_output: &mut egui::FullOutput,
     ) {
         if let Some(g) = self.gpu.as_mut() {
-            // keep a copy of the texture updates so a late fallback to the CPU renderer can start from scratch
-            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(c) = self.cpu.as_mut() {
+                c.apply_textures(&full_output.textures_delta.set);
+                c.free_textures(&full_output.textures_delta.free);
+            }
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 g.render(bg_color, physical_size, pixels_per_point, egui_ctx, full_output)
-            }))
-            .unwrap_or(false);
-            if ok {
-                self.fails = 0;
-            } else {
-                self.fails += 1;
-                if self.fails >= 40 {
-                    baseview::nylog("Vulkan keeps failing, switching to the CPU renderer");
-                    self.gpu = None;
-                    if let Ok(c) = software::Renderer::new(window, Default::default()) {
-                        self.cpu = Some(c);
-                    }
-                    // make egui resend every texture
-                    egui_ctx.set_fonts(egui::FontDefinitions::default());
+            }));
+            match r {
+                Ok(true) => {
+                    self.skipped = 0;
+                    self.crashes = 0;
+                }
+                // a skipped frame is normal while the window is minimised or hidden (alt-tab):
+                // only a very long run of them means the surface is really broken
+                Ok(false) if physical_size.width == 0 || physical_size.height == 0 => {}
+                Ok(false) => self.skipped += 1,
+                Err(_) => self.crashes += 1,
+            }
+            if self.crashes >= 3 || self.skipped >= 1800 {
+                baseview::nylog(&format!("Vulkan failing (crashes {}, skipped frames {}), switching to the CPU renderer", self.crashes, self.skipped));
+                self.gpu = None;
+                if let Some(c) = self.cpu.as_mut() {
+                    c.force_redraw();
                 }
             }
             return;
