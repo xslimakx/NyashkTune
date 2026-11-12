@@ -1,3 +1,8 @@
+## NyashkTune v1.1.1
+
+- **Voice range no longer caps high notes.** The range now sets only the lowest note (and the latency); upwards the tuner always searches to at least about C6. Before, with *Bass* (top ~F4) a voice going above it was read an octave too low and the chosen note jumped while gliding through F4 (test: C4 -> C5 glide with Bass, 878 blocks on a wrong note before, 0 now). Low bass notes are still found without octave errors.
+- **Switching ULTRA off brings back the normal sound at once** (tested: vibrato is back to the same amount as with ULTRA never used). The *ULTRA Hard Steps* preset no longer sets Retune and Transition to 0 ms, so after switching ULTRA off you are not left with a hard 0 ms tune.
+
 ## NyashkTune v1.1.0
 
 ### New in this build

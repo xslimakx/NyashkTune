@@ -445,7 +445,9 @@ impl NyashkTuneParams {
             vib_delay_ms: self.vib_delay.value(),
             midi_mode: self.midi_mode.value(),
             min_hz: self.range_hz(),
-            max_hz: self.range_limits().1,
+            // the range sets the lowest note (and the latency); upwards we always search to at least
+            // ~C6, so singing above the chosen range still tracks instead of falling an octave down
+            max_hz: self.range_limits().1.max(1100.0),
             gate_db: self.gate.value(),
             mix: self.mix.value() / 100.0,
             in_gain_db: self.in_gain.value(),

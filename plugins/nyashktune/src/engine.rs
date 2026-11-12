@@ -1452,9 +1452,13 @@ mod fuzz_tests {
 
     /// Short-time pitch (MIDI) of `x` around sample `c` by normalised autocorrelation, parabolic peak.
     fn pitch_at(x: &[f32], c: usize, fs: f64) -> f64 {
-        let w = 1536usize;
+        pitch_in(x, c, fs, 120.0, 700.0)
+    }
+
+    fn pitch_in(x: &[f32], c: usize, fs: f64, f_lo: f64, f_hi: f64) -> f64 {
+        let w = 2048usize;
         let a = c - w / 2;
-        let (lo, hi) = ((fs / 700.0) as usize, (fs / 120.0) as usize);
+        let (lo, hi) = ((fs / f_hi) as usize, (fs / f_lo) as usize);
         let ac = |lag: usize| -> f64 {
             let (mut s, mut e0, mut e1) = (0.0f64, 0.0f64, 0.0f64);
             for i in a..a + w {
@@ -1541,6 +1545,155 @@ mod fuzz_tests {
         // step: 60 ms after the input jumps, the output is already on C4
         let m = pitch_at(&u, ((1.5 + 0.06) * fs) as usize + lat, fs);
         assert!((m - 60.0).abs() < 0.15, "step too slow: {m:.2}");
+    }
+
+
+    /// The voice-range switch must not cap high notes: a "Bass" setting still tunes A4 and D5.
+    #[test]
+    fn range_does_not_cap_high_notes() {
+        let fs = 48000.0;
+        for (note, label) in [(69.0f64, "A4"), (74.0, "D5")] {
+            let x = sung(fs, |_| note + 0.3, 1.5);
+            let mut res = Vec::new();
+            for max_hz in [340.0f32, 1100.0] {
+                let mut p = Params::default();
+                p.scale = 0;
+                p.retune_ms = 0.0;
+                p.min_hz = 60.0;
+                p.max_hz = max_hz;
+                let mut e = Engine::new(fs, 60.0);
+                let lat = e.latency_samples() as usize;
+                let mut out = Vec::with_capacity(x.len());
+                for ch in x.chunks(128) {
+                    e.set_params(&p);
+                    for &v in ch {
+                        out.push(e.process_frame([v, v], 1)[0]);
+                    }
+                }
+                let mut worst = 0.0f64;
+                let mut t = 0.5;
+                while t < 1.3 {
+                    let m = pitch_in(&out, (t * fs) as usize + lat, fs, 150.0, 1400.0);
+                    worst = worst.max((m - note).abs());
+                    t += 0.05;
+                }
+                res.push(worst * 100.0);
+            }
+            println!("Bass range, {label}: old cap 340 Hz -> worst {:.0} c, now -> worst {:.1} c", res[0], res[1]);
+            assert!(res[1] < 15.0, "{label} not tuned with the Bass range: {:.1} c", res[1]);
+        }
+    }
+
+
+    /// Gliding up through the old top of the Bass range (F4) must not make the chosen note jump an octave.
+    #[test]
+    fn bass_range_glide_through_the_top() {
+        let fs = 48000.0;
+        let x = sung(fs, |t| 60.0 + 12.0 * (t / 3.0).min(1.0) + 0.3, 3.5);
+        for max_hz in [340.0f32, 1100.0] {
+            let mut p = Params::default();
+            p.scale = 0;
+            p.min_hz = 60.0;
+            p.max_hz = max_hz;
+            let mut e = Engine::new(fs, 60.0);
+            let (mut last, mut octave_jumps, mut wrong) = (0.0f32, 0, 0);
+            for (i, ch) in x.chunks(128).enumerate() {
+                e.set_params(&p);
+                for &v in ch {
+                    e.process_frame([v, v], 1);
+                }
+                let t = i as f64 * 128.0 / fs;
+                let tg = e.meters.target;
+                if t > 0.3 && tg > 0.0 {
+                    if last > 0.0 && (tg - last).abs() > 6.0 {
+                        octave_jumps += 1;
+                    }
+                    let sung_now = 60.0 + 12.0 * ((t - 0.05) / 3.0).min(1.0) + 0.3;
+                    if (tg as f64 - sung_now).abs() > 1.5 {
+                        wrong += 1;
+                    }
+                    last = tg;
+                }
+            }
+            println!("Bass range, glide C4 -> C5, search up to {max_hz} Hz: octave jumps {octave_jumps}, blocks on a wrong note {wrong}");
+            if max_hz > 1000.0 {
+                assert_eq!(octave_jumps, 0);
+                assert!(wrong < 10, "{wrong}");
+            }
+        }
+    }
+
+    /// With the wider search a real bass note must still be found (no octave-up errors).
+    #[test]
+    fn low_bass_still_tracks_with_wide_search() {
+        let fs = 48000.0;
+        for note in [40.0f64, 45.0, 50.0] {
+            let x = sung(fs, |t| note + 0.3 + 0.2 * (2.0 * PI * 5.0 * t).sin(), 1.5);
+            let mut p = Params::default();
+            p.scale = 0;
+            p.retune_ms = 0.0;
+            p.min_hz = 60.0;
+            p.max_hz = 1100.0;
+            let mut e = Engine::new(fs, 60.0);
+            let lat = e.latency_samples() as usize;
+            let mut out = Vec::with_capacity(x.len());
+            let mut wrong = 0;
+            for (i, ch) in x.chunks(128).enumerate() {
+                e.set_params(&p);
+                for &v in ch {
+                    out.push(e.process_frame([v, v], 1)[0]);
+                }
+                let tg = e.meters.target;
+                if i as f64 * 128.0 / fs > 0.3 && tg > 0.0 && (tg as f64 - note).abs() > 0.6 {
+                    wrong += 1;
+                }
+            }
+            let m = pitch_in(&out, (1.0 * fs) as usize + lat, fs, 50.0, 400.0);
+            println!("bass note {note}: target wrong in {wrong} blocks, output {m:.2}");
+            assert_eq!(wrong, 0, "note {note}: octave error");
+            assert!((m - note).abs() < 0.15, "note {note}: output {m:.2}");
+        }
+    }
+
+    /// Switching ULTRA off really brings back the normal behaviour (vibrato comes back).
+    #[test]
+    fn ultra_off_restores_normal_behaviour() {
+        let fs = 48000.0;
+        let curve = |t: f64| 57.0 + 0.4 * (2.0 * PI * 5.5 * t).sin();
+        let x = sung(fs, curve, 3.0);
+        let measure = |switch_at: Option<f64>| -> f64 {
+            let mut p = Params::default();
+            p.scale = 0;
+            p.retune_ms = 120.0;
+            p.natural_vib = 1.0;
+            let mut e = Engine::new(fs, 70.0);
+            let lat = e.latency_samples() as usize;
+            let mut out = Vec::with_capacity(x.len());
+            for (i, ch) in x.chunks(128).enumerate() {
+                let t = i as f64 * 128.0 / fs;
+                p.ultra = match switch_at {
+                    Some(s) if t < s => 1.0,
+                    _ => 0.0,
+                };
+                e.set_params(&p);
+                for &v in ch {
+                    out.push(e.process_frame([v, v], 1)[0]);
+                }
+            }
+            let (mut sum, mut n) = (0.0, 0);
+            let mut t = 2.0;
+            while t < 2.9 {
+                sum += (pitch_at(&out, (t * fs) as usize + lat, fs) - 57.0).abs();
+                n += 1;
+                t += 0.01;
+            }
+            sum / n as f64 * 100.0
+        };
+        let normal = measure(None);
+        let after = measure(Some(1.5));
+        println!("vibrato kept: normal {normal:.1} c, 0.5 s after switching ULTRA off {after:.1} c");
+        assert!(normal > 10.0, "test voice should keep vibrato in normal mode");
+        assert!((after - normal).abs() < 0.2 * normal, "ULTRA still active after switching off: {after:.1} vs {normal:.1}");
     }
 
     /// A voice wobbling right between two notes must not flicker back and forth between them.

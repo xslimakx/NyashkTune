@@ -445,10 +445,9 @@ fn apply_preset(setter: &ParamSetter, p: &NyashkTuneParams, idx: usize) {
         }
         28 => {
             // ULTRA: MIDI-like note steps
+            // ULTRA does everything itself: switching it off brings back the normal settings
             set_b(setter, &p.ultra_on, true);
             set_f(setter, &p.ultra, 100.0);
-            set_f(setter, &p.retune, 0.0);
-            set_f(setter, &p.transition, 0.0);
         }
         _ => {}
     }
