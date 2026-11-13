@@ -1,3 +1,12 @@
+## NyashkTune 1.1.3
+
+- **Notes no longer get missed at high Tracking.** A note sung a little off (25-40 cents) right after a step could stay on the previous note for the whole held note when Tracking was high. Tracking now only delays a switch for a moment; if your voice stays nearer to another note, the tuner always moves to it.
+- **Cleaner transitions.** On a jump of about a semitone or more the tuner used to drag through the notes in between and could settle on one of them (61 -> 59 landing on 60). It now goes straight to the new note.
+- **Faster landing on the new note:** about 45-55 ms at the default Tracking (it was up to 250 ms at Tracking 100 %, now about 100-150 ms there).
+- **ULTRA steps on time.** ULTRA no longer slows down the note choice, and a wide vibrato no longer flips it to the neighbouring note (it stays within 2 cents of the note).
+- **Octave leaps.** After a leap up of about an octave the pitch detector could stay an octave low for the whole note (wrong octave on screen, rougher shifting). It now follows the leap.
+- New stress tests: hundreds of sung transitions (jumps, glides, scoops, off-pitch notes with vibrato; chromatic and minor/phrygian scales; every Tracking / ULTRA / Retune setting) must never pick a note outside the jump, never show steps on a clean jump, land quickly and sit on the note.
+
 ## NyashkTune v1.1.2
 
 - **Alt-tab fix (Linux):** after alt-tab, minimising or covering the window, parts of the picture (backgrounds, knobs, images) could stay blank until something on them moved. The window is now drawn again in full whenever the system throws its contents away, and pictures are no longer lost while the window is hidden or a frame is skipped.

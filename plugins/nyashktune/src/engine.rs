@@ -684,7 +684,13 @@ impl Engine {
                     (a.0 as f32 / prev).ln().abs().partial_cmp(&(b.0 as f32 / prev).ln().abs()).unwrap()
                 });
             if let Some(n) = near {
-                if best.map_or(true, |b| n.1 < b.1 + 0.12) {
+                // YIN also dips at 2x / 3x the true period: after a leap up an octave the old period
+                // is exactly such a multiple. Continuity must not keep us on it while a clear dip at
+                // 1/2 or 1/3 of it is there - that one is the real fundamental.
+                let sub_of_fund = cands.iter().any(|c| {
+                    c.1 < 0.15 && c.1 < n.1 + 0.08 && [2.0f32, 3.0].iter().any(|k| ((n.0 as f32 / c.0 as f32) / k).ln().abs() < 0.05)
+                });
+                if !sub_of_fund && best.map_or(true, |b| n.1 < b.1 + 0.12) {
                     best = Some(n);
                 }
             }
@@ -893,19 +899,31 @@ impl Engine {
         };
         let tr = (self.p.tracking as f64).clamp(0.0, 1.0);
         let u = (self.p.ultra as f64).clamp(0.0, 1.0);
-        let hyst = 0.08 + 0.42 * tr + 0.10 * u;
+        // ULTRA does not make the choice slower or stickier: it steps hard, so it must step on time
+        let _ = u;
+        // quick switch only for a real jump (the voice is >= ~0.7 st away from the current note):
+        // vibrato peaks never get there; a landing a little off pitch is taken by the `hold` rule
+        let hyst = 0.65 + 0.10 * tr;
         // a new note must hold for a moment before we jump to it: no flicker between neighbours
         // on scoops, cracks or a voice sitting right between two notes
-        let dwell = 0.010 + 0.030 * tr + 0.006 * u;
+        let dwell = 0.010 + 0.020 * tr;
         if self.have_note && self.is_allowed(self.cur_note) {
-            if best != self.cur_note && (basis - self.cur_note as f64).abs() > bd + hyst {
+            let d_cur = (basis - self.cur_note as f64).abs();
+            // Two ways to move on: clearly past the hysteresis (quick, after `dwell`), or simply
+            // nearer to another note for a sustained moment. The second keeps a high Tracking from
+            // holding a note sung a little off on the previous / a passed-through note for good;
+            // Tracking only delays it. The 0.1 st margin keeps a voice sitting between two notes
+            // from flipping.
+            let hold = 0.05 + 0.05 * tr;
+            let quick = d_cur > hyst && d_cur > bd + 0.3;
+            if best != self.cur_note && (quick || d_cur > bd + 0.1) {
                 if self.cand_note == best {
                     self.cand_age += dt;
                 } else {
                     self.cand_note = best;
                     self.cand_age = 0.0;
                 }
-                if self.cand_age >= dwell {
+                if (quick && self.cand_age >= dwell) || self.cand_age >= hold {
                     self.cur_note = best;
                     self.note_age = 0.0;
                     self.transition = true;
@@ -955,9 +973,11 @@ impl Engine {
         let basis = midi + (self.slow_midi - midi) * nv;
 
         // the note is chosen from a lightly smoothed pitch (vibrato and jitter do not flip it to a
-        // neighbour); a clear jump of more than ~1.2 semitones is taken at once
-        let tau_n = 0.012 + 0.030 * (self.p.tracking as f64).clamp(0.0, 1.0) + 0.030 * u;
-        if (basis - self.note_sm).abs() > 1.2 {
+        // neighbour); a clear jump is taken at once (see below)
+        let tau_n = 0.010 + 0.020 * (self.p.tracking as f64).clamp(0.0, 1.0);
+        // a step of ~a semitone or more is taken at once: smoothing it would crawl through the
+        // notes in between and could settle on one of them (61 -> 59 landing on 60)
+        if (basis - self.note_sm).abs() > 0.8 {
             self.note_sm = basis;
         } else {
             self.note_sm += (basis - self.note_sm) * (1.0 - (-dt / tau_n).exp());
@@ -1730,6 +1750,166 @@ mod fuzz_tests {
             let limit = if tracking == 0.0 { 10 } else { 3 };
             assert!(switches <= limit, "flicker: {switches} switches (ultra {ultra}, tracking {tracking})");
         }
+    }
+
+    /// A held note sung a bit off (25-40 cents) right after a step must still be corrected to the
+    /// nearest note of the scale, at every Tracking setting: Tracking may delay a switch, never
+    /// keep the voice on the previous note for the whole held note.
+    #[test]
+    fn held_notes_land_on_the_nearest_note() {
+        let fs = 48000.0;
+        // (sung pitch, expected note), 0.6 s each, light 12 cent vibrato
+        let seq: [(f64, i32); 7] = [(57.0, 57), (57.65, 58), (60.3, 60), (59.3, 59), (61.35, 61), (60.62, 61), (59.4, 59)];
+        let x = sung(fs, |t| {
+            let i = ((t / 0.6) as usize).min(seq.len() - 1);
+            seq[i].0 + 0.12 * (2.0 * PI * 5.5 * t).sin()
+        }, 0.6 * seq.len() as f64);
+        for tracking in [0.0f32, 0.22, 0.6, 1.0] {
+            for ultra in [0.0f32, 1.0] {
+                let mut e = Engine::new(fs, 70.0);
+                let mut p = Params::default();
+                p.scale = 0;
+                p.tracking = tracking;
+                p.ultra = ultra;
+                let mut wrong = Vec::new();
+                for (i, ch) in x.chunks(128).enumerate() {
+                    e.set_params(&p);
+                    for &s in ch {
+                        e.process_frame([s, s], 1);
+                    }
+                    let t = i as f64 * 128.0 / fs;
+                    let k = (t / 0.6) as usize;
+                    // judge the last 0.3 s of every held note
+                    if k < seq.len() && t - k as f64 * 0.6 > 0.3 {
+                        let tg = e.meters.target as i32;
+                        if tg != seq[k].1 {
+                            wrong.push((k, tg));
+                        }
+                    }
+                }
+                wrong.dedup();
+                println!("tracking {tracking} ultra {ultra}: wrong {:?}", wrong);
+                assert!(wrong.is_empty(), "tracking {tracking} ultra {ultra}: held notes on the wrong note {:?}", wrong);
+            }
+        }
+    }
+
+    /// Realistic note transitions, many of them: steps of 1..12 semitones up and down, sung as an
+    /// instant jump, a 40 ms or 120 ms glide or a scoop from below, each note a little off pitch
+    /// with vibrato, chromatic and B natural minor, at several Tracking / ULTRA / Retune settings.
+    /// For every transition: no note outside the A..B span is ever chosen (no octave errors, no
+    /// overshoot), an instant jump goes straight to the new note (no stairs), the new note is
+    /// reached quickly and then held without flicker, and with Retune 0 the output really sits on it.
+    #[test]
+    fn transitions_are_clean() {
+        let fs = 48000.0;
+        let dur = 0.4;
+        let smooth = |x: f64| { let x = x.clamp(0.0, 1.0); x * x * (3.0 - 2.0 * x) };
+        let mut report = Vec::new();
+        for (seed0, scale, key) in [(1234u32, 0usize, 0usize), (1235, 2, 11), (4242, 0, 0), (4243, 2, 11), (31337, 9, 4)] {
+            let allowed: Vec<i32> = (50..=72).filter(|m| (allowed_mask(scale, key, 0) >> (m % 12)) & 1 == 1).collect();
+            // random walk over the allowed notes with every interval size represented
+            let mut seed = 31337u32 + scale as u32;
+            let mut notes = vec![allowed[allowed.len() / 2]];
+            for k in 0..60 {
+                let a = *notes.last().unwrap();
+                let want = 1 + (k % 12) as i32;
+                let up = xorshift(&mut seed) > 0.5;
+                let cands: Vec<i32> = allowed.iter().copied().filter(|&m| m != a && ((m - a).abs() - want).abs() <= 1).collect();
+                let pick = cands.iter().copied().filter(|&m| (m > a) == up).next().or(cands.first().copied()).unwrap_or(allowed[0]);
+                notes.push(pick);
+            }
+            let offs: Vec<f64> = (0..notes.len()).map(|_| (xorshift(&mut seed) as f64 - 0.5) * 0.56).collect();
+            let kind = |k: usize| k % 4; // 0 jump, 1 glide 40 ms, 2 glide 120 ms, 3 scoop
+            let glide = |k: usize| [0.0, 0.04, 0.12, 0.09][kind(k)];
+            let curve = |t: f64| -> f64 {
+                let k = ((t / dur) as usize).min(notes.len() - 1);
+                let tau = t - k as f64 * dur;
+                let b = notes[k] as f64 + offs[k];
+                let a = if k == 0 { b } else { notes[k - 1] as f64 + offs[k - 1] };
+                let base = match kind(k) {
+                    0 => b,
+                    3 => if k == 0 { b } else { b - 0.6 + 0.6 * smooth(tau / 0.09) },
+                    _ => a + (b - a) * smooth(tau / glide(k)),
+                };
+                base + 0.2 * smooth((tau - 0.12) / 0.08) * (2.0 * PI * 5.5 * tau).sin()
+            };
+            let x = sung(fs, curve, dur * notes.len() as f64);
+            for (tracking, ultra, retune) in [(0.0f32, 0.0f32, 0.0f32), (0.22, 0.0, 50.0), (0.22, 0.0, 0.0), (0.6, 0.0, 0.0), (1.0, 0.0, 0.0), (0.22, 1.0, 50.0), (1.0, 1.0, 50.0)] {
+                let mut e = Engine::new(fs, 70.0);
+                let lat = e.latency_samples() as usize;
+                let mut p = Params::default();
+                p.scale = scale;
+                p.key = key;
+                p.tracking = tracking;
+                p.ultra = ultra;
+                p.retune_ms = retune;
+                p.transition_ms = retune;
+                let mut out = Vec::with_capacity(x.len());
+                let mut tg: Vec<(f64, i32)> = Vec::new();
+                let mut hzs: Vec<f32> = Vec::new();
+                // TRACE=1: per-block note-choice state for unsettled notes
+                let mut dbg: Vec<(f64, i32, f64)> = Vec::new();
+
+                for (i, ch) in x.chunks(64).enumerate() {
+                    e.set_params(&p);
+                    for &s in ch {
+                        out.push(e.process_frame([s, s], 1)[0]);
+                    }
+                    tg.push((i as f64 * 64.0 / fs, e.meters.target as i32));
+                    hzs.push(if e.meters.voiced { e.meters.hz } else { 0.0 });
+                    dbg.push((e.note_sm, e.cand_note, e.cand_age));
+                }
+                let (mut bad_span, mut stairs, mut unsettled, mut off_out) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let mut worst_settle = 0.0f64;
+                for k in 1..notes.len() {
+                    let (a, b) = (notes[k - 1], notes[k]);
+                    let t0 = k as f64 * dur;
+                    let arrive = t0 + glide(k);
+                    let w: Vec<(f64, i32)> = tg.iter().copied().filter(|(t, _)| *t >= t0 && *t < t0 + dur).collect();
+                    let lo = a.min(b) - if kind(k) == 3 { 1 } else { 0 };
+                    let hi = a.max(b);
+                    if let Some(&(t, m)) = w.iter().find(|(_, m)| *m != 0 && (*m < lo || *m > hi)) {
+                        bad_span.push((k, a, b, m, ((t - t0) * 1000.0) as i32));
+                    }
+                    if kind(k) == 0 {
+                        if let Some(&(_, m)) = w.iter().find(|(_, m)| *m != 0 && *m != a && *m != b) {
+                            stairs.push((k, a, b, m));
+                        }
+                    }
+                    // settled: from here to the end of the note the target is b
+                    let settle = w.iter().rposition(|(_, m)| *m != b).map(|i| w.get(i + 1).map(|v| v.0)).unwrap_or(Some(t0));
+                    match settle {
+                        Some(ts) if ts < t0 + dur - 0.1 => worst_settle = worst_settle.max(ts - arrive),
+                        _ => {
+                            unsettled.push((k, a, b));
+                            if std::env::var("TRACE").is_ok() {
+                                for (i, (t, m)) in tg.iter().enumerate() {
+                                    if *t >= t0 - 0.05 && *t < t0 + dur && i % 2 == 0 {
+                                        let d = if hzs[i] > 0.0 { 69.0 + 12.0 * (hzs[i] / 440.0).log2() } else { 0.0 };
+                                        println!("   k{k} {:>4.0}ms in {:.2} det {:.2} tgt {m} sm {:.2} cand {} age {:.3}", (t - t0) * 1000.0, curve(*t), d, dbg[i].0, dbg[i].1, dbg[i].2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if retune == 0.0 || ultra == 1.0 {
+                        let m = pitch_at(&out, ((t0 + 0.3) * fs) as usize + lat, fs);
+                        if (m - b as f64).abs() > 0.1 {
+                            off_out.push((k, b, ((m - b as f64) * 100.0).round() as i32));
+                        }
+                    }
+                }
+                let line = format!("seed {seed0} scale {scale} key {key} tracking {tracking} ultra {ultra} retune {retune}: settle {:.0} ms, outside span {:?}, stairs {:?}, unsettled {:?}, output off {:?}",
+                    worst_settle * 1000.0, bad_span, stairs, unsettled, off_out);
+                println!("{line}");
+                let limit = 0.07 + 0.09 * tracking as f64;
+                if !bad_span.is_empty() || !stairs.is_empty() || !unsettled.is_empty() || !off_out.is_empty() || worst_settle > limit {
+                    report.push(line);
+                }
+            }
+        }
+        assert!(report.is_empty(), "transition problems:\n{}", report.join("\n"));
     }
 
     /// Switching modules on and off while singing must not click.
