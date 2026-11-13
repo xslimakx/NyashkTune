@@ -121,10 +121,7 @@ pub struct Params {
     pub ref_a: f32,
     pub retune_ms: f32,   // how fast the pitch settles onto the note
     pub transition_ms: f32, // how fast it glides when the target note changes
-    pub amount: f32,      // 0..1
-    pub flex_cents: f32,
-    pub humanize: f32,    // 0..1
-    pub natural_vib: f32, // 0..1
+    pub amount: f32,      // 0..1 (Correction %)
     pub transpose: f32,   // semitones
     pub fine_cents: f32,
     pub formant_semis: f32,
@@ -135,11 +132,21 @@ pub struct Params {
     pub formant_mode: FormantMode,
     pub formant_tilt: f32,   // -1..1, formant shift applied more to highs (+) or lows (-)
     pub formant_follow: f32, // 0..1, how much the formants follow the pitch correction when not preserved
-    pub tracking: f32,       // 0..1, how reluctantly the tuner jumps to another note
-    /// 0..1 ULTRA amount (0 when ULTRA is switched off). 1 = MIDI-like: the output sits exactly on the
-    /// note and steps to the next one instantly, no glide, no vibrato, no drift.
-    pub ultra: f32,
-    pub bypass_mask: u16,    // pitch classes that are left uncorrected
+    /// Per pitch class (C = 0): 0 follow the scale, 1 legal, 2 illegal (to the nearest legal note),
+    /// 3 illegal - pitch up (to the next legal note above), 4 illegal - pitch down, 5 bypass
+    /// (legal, but sung as it is).
+    pub note_override: [u8; 12],
+    /// Tolerance: the voice must pass 50 + `tol_cents` cents from the current note, for `tol_ms`,
+    /// before the target note changes (0 / 0 = straight to the nearest legal note).
+    pub tol_cents: f32,
+    pub tol_ms: f32,
+    /// Vibrato On: the note centre is corrected and the singer's own vibrato is kept, scaled by
+    /// `vib_amount` (0 flat .. 1 as sung .. 2 exaggerated). Off: the whole pitch is corrected.
+    pub keep_vibrato: bool,
+    pub vib_amount: f32,
+    /// Correction range (MIDI notes): outside it the voice passes uncorrected.
+    pub range_lo: f32,
+    pub range_hi: f32,
     pub vib_shape: usize,    // 0 sine, 1 triangle, 2 saw, 3 random
     pub air_db: f32,         // high shelf on the wet signal
     pub drive: f32,          // 0..1 soft saturation on the wet signal
@@ -165,12 +172,9 @@ impl Default for Params {
             scale: 1,
             custom_mask: 0xFFF,
             ref_a: 440.0,
-            retune_ms: 50.0,
-            transition_ms: 50.0,
+            retune_ms: 15.0,
+            transition_ms: 120.0,
             amount: 1.0,
-            flex_cents: 0.0,
-            humanize: 0.0,
-            natural_vib: 0.0,
             transpose: 0.0,
             fine_cents: 0.0,
             formant_semis: 0.0,
@@ -181,9 +185,13 @@ impl Default for Params {
             formant_mode: FormantMode::Classic,
             formant_tilt: 0.0,
             formant_follow: 1.0,
-            tracking: 0.22,
-            ultra: 0.0,
-            bypass_mask: 0,
+            note_override: [0; 12],
+            tol_cents: 0.0,
+            tol_ms: 0.0,
+            keep_vibrato: true,
+            vib_amount: 1.0,
+            range_lo: 0.0,
+            range_hi: 127.0,
             vib_shape: 0,
             air_db: 0.0,
             drive: 0.0,
@@ -291,6 +299,8 @@ pub struct Meters {
 pub struct Engine {
     p: Params,
     allowed_pc: u16,
+    /// effective note states (1 legal, 2 illegal, 3 up, 4 down, 5 bypass) per pitch class
+    states: [u8; 12],
     pub held: [bool; 128],
     pub meters: Meters,
     pub dbg_lag: f64,
@@ -358,7 +368,15 @@ pub struct Engine {
     cand_age: f64,
     far_note: i32, // the voice is clearly nearer to another note (see pick_note)
     far_age: f64,
-    note_sm: f64,     // lightly smoothed pitch used only to *choose* the note (not to correct it)
+    note_sm: f64,
+    centre: f64,      // note centre: vibrato taken out (midpoint of its last peak and trough)
+    vib_sm: f64,      // lightly smoothed pitch the vibrato turning points are found on
+    ext: f64,         // running extreme since the last turning point
+    ext_t: f64,
+    rising: bool,
+    tp_max: (f64, f64), // last peak (value, time)
+    tp_min: (f64, f64), // last trough
+    clock: f64,     // lightly smoothed pitch used only to *choose* the note (not to correct it)
 }
 
 #[inline]
@@ -378,6 +396,7 @@ impl Engine {
         let mut e = Self {
             p: Params::default(),
             allowed_pc: 0xFFF,
+            states: [1; 12],
             held: [false; 128],
             meters: Meters { voiced: false, hz: 0.0, target: 0.0, corr: 0.0 },
             dbg_lag: 0.0,
@@ -434,6 +453,14 @@ impl Engine {
             far_note: i32::MIN,
             far_age: 0.0,
             note_sm: 60.0,
+            centre: 60.0,
+            vib_sm: 60.0,
+            ext: 60.0,
+            ext_t: 0.0,
+            rising: true,
+            tp_max: (f64::NAN, -1.0),
+            tp_min: (f64::NAN, -1.0),
+            clock: 0.0,
         };
         e.set_lowest_hz(lowest_hz);
         e
@@ -491,6 +518,16 @@ impl Engine {
 
     pub fn set_params(&mut self, p: &Params) {
         self.allowed_pc = allowed_mask(p.scale, p.key, p.custom_mask);
+        for pc in 0..12 {
+            let ov = p.note_override[pc];
+            self.states[pc] = if (1..=5).contains(&ov) {
+                ov
+            } else if (self.allowed_pc >> pc) & 1 == 1 {
+                1
+            } else {
+                2
+            };
+        }
         if p.air_db != self.air_cache {
             self.air_cache = p.air_db;
             for a in self.air.iter_mut() {
@@ -843,6 +880,24 @@ impl Engine {
         best
     }
 
+    /// The pitch mark right after `m`, if it is already known.
+    fn mark_after(&self, m: i64) -> Option<i64> {
+        let n = self.nmarks;
+        let oldest = n.saturating_sub(MARK_RING as u64 - 2);
+        let mut i = n;
+        let mut after = None;
+        while i > oldest {
+            i -= 1;
+            let k = self.marks[(i % MARK_RING as u64) as usize];
+            if k > m {
+                after = Some(k);
+            } else {
+                break;
+            }
+        }
+        after
+    }
+
     fn pick_mark(&self, nom: f64) -> i64 {
         let n = self.nmarks;
         if n == 0 {
@@ -881,54 +936,76 @@ impl Engine {
             }
             return false;
         }
-        (self.allowed_pc >> pc) & 1 == 1
+        matches!(self.states[pc], 1 | 5)
     }
 
-    fn pick_note(&mut self, basis: f64, raw: f64, dt: f64) -> bool {
-        let base = basis.floor() as i32;
+    fn nearest_allowed(&self, v: f64) -> Option<(i32, f64)> {
+        let base = v.floor() as i32;
         let mut best = None;
         let mut bd = 1e9;
         for m in (base - 7)..=(base + 8) {
             if self.is_allowed(m) {
-                let d = (basis - m as f64).abs();
+                let d = (v - m as f64).abs();
                 if d < bd {
                     bd = d;
                     best = Some(m);
                 }
             }
         }
-        let Some(best) = best else {
+        best.map(|m| (m, bd))
+    }
+
+    /// The target for a pitch `v` by the note states: a legal (or bypass) note is its own target,
+    /// an illegal one goes to the nearest legal note, "pitch up" / "pitch down" to the next legal
+    /// note in that direction.
+    fn target_for(&self, v: f64) -> Option<(i32, f64)> {
+        if !self.p.midi_mode {
+            let n = v.round() as i32;
+            match self.states[n.rem_euclid(12) as usize] {
+                1 | 5 => return Some((n, (v - n as f64).abs())),
+                3 => return ((n + 1)..=(n + 12)).find(|m| self.is_allowed(*m)).map(|m| (m, (v - m as f64).abs())),
+                4 => return ((n - 12)..n).rev().find(|m| self.is_allowed(*m)).map(|m| (m, (v - m as f64).abs())),
+                _ => {}
+            }
+        }
+        self.nearest_allowed(v)
+    }
+
+    /// Choose the target note (Waves-Tune-style): the target for the current pitch by the note
+    /// states; it changes once the voice is past 50 + Tolerance-cents from the current note and has
+    /// stayed there for Tolerance-time (both off: almost at once, with a small guard against flicker).
+    /// `basis` is what the choice is made on (the note centre with Vibrato On), `raw` the plain pitch.
+    fn pick_note(&mut self, basis: f64, raw: f64, dt: f64) -> bool {
+        let Some((best, _)) = self.target_for(basis) else {
             self.have_note = false;
             return false;
         };
-        let tr = (self.p.tracking as f64).clamp(0.0, 1.0);
-        let u = (self.p.ultra as f64).clamp(0.0, 1.0);
-        // ULTRA does not make the choice slower or stickier: it steps hard, so it must step on time
-        let _ = u;
-        // quick switch only for a real jump (the voice is >= ~0.7 st away from the current note):
-        // vibrato peaks never get there; a landing a little off pitch is taken by the `hold` rule
-        let hyst = 0.65 + 0.10 * tr;
-        // a new note must hold for a moment before we jump to it: no flicker between neighbours
-        // on scoops, cracks or a voice sitting right between two notes
-        let dwell = 0.010 + 0.020 * tr;
-        if self.have_note && self.is_allowed(self.cur_note) {
-            // Never pull the voice further than to its nearest note: when the (unsmoothed) pitch is
-            // already clearly nearer to another note (by > 0.9 st), switch now. Waiting here held the
-            // old note through fast slides and pulled the voice 2-3 st (even 12 st on a detector
-            // octave slip) for tens of ms - heard as a broken, gargled sound. Vibrato never gets here.
-            let (mut rb, mut rbd) = (self.cur_note, 1e9f64);
-            let rbase = raw.floor() as i32;
-            for m in (rbase - 7)..=(rbase + 8) {
-                if self.is_allowed(m) && (raw - m as f64).abs() < rbd {
-                    rbd = (raw - m as f64).abs();
-                    rb = m;
-                }
-            }
-            // confirmed for ~12 ms: a single in-between reading in the middle of a big jump is ignored.
-            // What must last is "clearly away from the current note", not one particular new note:
-            // on a fast slide the nearest note changes every ~10 ms and waiting for one of them kept
-            // the old note (pulling 3-4 st); after a detector octave slip it pulled 12 st.
-            if rb != self.cur_note && (raw - self.cur_note as f64).abs() - rbd > 0.9 {
+        if !(self.have_note && self.is_allowed(self.cur_note)) {
+            self.cur_note = best;
+            self.have_note = true;
+            self.note_age = 0.0;
+            self.transition = true; // a new note after a pause counts as a note transition
+            self.cand_note = i32::MIN;
+            self.far_note = i32::MIN;
+            return true;
+        }
+        let cur = self.cur_note;
+        let switch = |e: &mut Self, m: i32| {
+            e.cur_note = m;
+            e.note_age = 0.0;
+            e.transition = true;
+            e.cand_note = i32::MIN;
+            e.cand_age = 0.0;
+            e.far_note = i32::MIN;
+            e.far_age = 0.0;
+        };
+        // Safety, whatever the Tolerance: never pull the voice further than to its own target.
+        // When the plain pitch is clearly (> 0.9 st) nearer its target than the current note for
+        // ~12 ms, switch - fast slides and detector octave slips used to hold the old note and pull
+        // the voice 2-12 st. Being away is what must last, not one particular new note.
+        let tol = (self.p.tol_cents as f64 / 100.0).clamp(0.0, 0.4);
+        if let Some((rb, rbd)) = self.target_for(raw) {
+            if rb != cur && (raw - cur as f64).abs() - rbd > 0.9 + tol {
                 self.far_note = rb;
                 self.far_age += dt;
             } else {
@@ -936,49 +1013,79 @@ impl Engine {
                 self.far_age = 0.0;
             }
             if self.far_note == rb && self.far_age >= 0.012 {
-                self.far_note = i32::MIN;
-                self.far_age = 0.0;
-                self.cur_note = rb;
-                self.note_age = 0.0;
-                self.transition = true;
-                self.cand_note = i32::MIN;
-                self.cand_age = 0.0;
+                switch(self, rb);
                 self.note_sm = raw;
+                self.centre = raw;
                 return true;
             }
-            let d_cur = (basis - self.cur_note as f64).abs();
-            // Two ways to move on: clearly past the hysteresis (quick, after `dwell`), or simply
-            // nearer to another note for a sustained moment. The second keeps a high Tracking from
-            // holding a note sung a little off on the previous / a passed-through note for good;
-            // Tracking only delays it. The 0.1 st margin keeps a voice sitting between two notes
-            // from flipping.
-            let hold = 0.05 + 0.05 * tr;
-            let quick = d_cur > hyst && d_cur > bd + 0.3;
-            if best != self.cur_note && (quick || d_cur > bd + 0.1) {
-                if self.cand_note == best {
-                    self.cand_age += dt;
-                } else {
-                    self.cand_note = best;
-                    self.cand_age = 0.0;
-                }
-                if (quick && self.cand_age >= dwell) || self.cand_age >= hold {
-                    self.cur_note = best;
-                    self.note_age = 0.0;
-                    self.transition = true;
-                    self.cand_note = i32::MIN;
-                }
+        }
+        // Tolerance (an 8 c / 15 ms guard even when off, against flicker right on a note border)
+        let d_cur = (basis - cur as f64).abs();
+        let past = d_cur > 0.5 + tol.max(0.08);
+        let hold = (self.p.tol_ms as f64 / 1000.0).clamp(0.0, 0.3).max(0.015);
+        // past the Tolerance border, but not past the small guard: allowed after a longer while, so
+        // the guard only stops quick flicker and never keeps a note the voice has clearly left
+        let past_border = d_cur > 0.5 + tol;
+        if best != cur && past_border {
+            if self.cand_note == best {
+                self.cand_age += dt;
             } else {
-                self.cand_note = i32::MIN;
+                self.cand_note = best;
                 self.cand_age = 0.0;
             }
+            if (past && self.cand_age >= hold) || self.cand_age >= hold + 0.12 {
+                switch(self, best);
+            }
         } else {
-            self.cur_note = best;
-            self.have_note = true;
-            self.note_age = 0.0;
-            self.transition = true; // a new note after a pause counts as a note transition
             self.cand_note = i32::MIN;
+            self.cand_age = 0.0;
         }
         true
+    }
+
+    /// Follow the note centre: the midpoint of the last vibrato peak and trough while the voice
+    /// oscillates like vibrato (2-16 Hz, under 2 st wide, still inside it), the pitch itself otherwise
+    /// (a slide or a jump is followed at once).
+    fn track_centre(&mut self, midi: f64, dt: f64) {
+        self.clock += dt;
+        let t = self.clock;
+        self.vib_sm += (midi - self.vib_sm) * (1.0 - (-dt / 0.008).exp());
+        let s = self.vib_sm;
+        const TURN: f64 = 0.06; // 6 c back from the extreme = a turning point
+        if self.rising {
+            if s >= self.ext {
+                self.ext = s;
+                self.ext_t = t;
+            } else if s < self.ext - TURN {
+                self.tp_max = (self.ext, self.ext_t);
+                self.rising = false;
+                self.ext = s;
+                self.ext_t = t;
+            }
+        } else if s <= self.ext {
+            self.ext = s;
+            self.ext_t = t;
+        } else if s > self.ext + TURN {
+            self.tp_min = (self.ext, self.ext_t);
+            self.rising = true;
+            self.ext = s;
+            self.ext_t = t;
+        }
+        let (hi, th) = self.tp_max;
+        let (lo, tl) = self.tp_min;
+        let half = (th - tl).abs();
+        let vibrato = hi.is_finite()
+            && lo.is_finite()
+            && hi > lo
+            && hi - lo < 2.0
+            && (0.03..=0.25).contains(&half)
+            && t - th.max(tl) < 0.3
+            // still inside the band of its last peak and trough: after a step to another note the
+            // old peak / trough must not pull the centre back half-way
+            && s > lo - 0.15
+            && s < hi + 0.15;
+        let target = if vibrato { 0.5 * (hi + lo) } else { s };
+        self.centre += (target - self.centre) * (1.0 - (-dt / 0.025).exp());
     }
 
     fn compute_ratio(&mut self, dt: f64, voiced: bool, period: f64) -> f64 {
@@ -998,51 +1105,56 @@ impl Engine {
         if !self.was_voiced {
             self.slow_midi = midi;
             self.note_sm = midi;
+            self.centre = midi;
+            self.vib_sm = midi;
+            self.ext = midi;
+            self.tp_max = (f64::NAN, -1.0);
+            self.tp_min = (f64::NAN, -1.0);
             self.have_note = false;
             self.note_age = 0.0;
             self.transition = true;
             self.was_voiced = true;
         }
         self.slow_midi += (midi - self.slow_midi) * (1.0 - (-dt / 0.12).exp());
+        self.track_centre(midi, dt);
 
-        // ULTRA pulls every "soft" control towards hard MIDI-like stepping
-        let u = (self.p.ultra as f64).clamp(0.0, 1.0);
-        let nv = (self.p.natural_vib as f64).clamp(0.0, 1.0) * (1.0 - u);
-        let basis = midi + (self.slow_midi - midi) * nv;
-
-        // the note is chosen from a lightly smoothed pitch (vibrato and jitter do not flip it to a
-        // neighbour); a clear jump is taken at once (see below)
-        let tau_n = 0.010 + 0.020 * (self.p.tracking as f64).clamp(0.0, 1.0);
-        // a step of ~a semitone or more is taken at once: smoothing it would crawl through the
-        // notes in between and could settle on one of them (61 -> 59 landing on 60)
-        if (basis - self.note_sm).abs() > 0.8 {
-            self.note_sm = basis;
+        // a lightly smoothed pitch; a step of ~a semitone or more is taken at once (smoothing it
+        // would crawl through the notes in between and could settle on one of them)
+        if (midi - self.note_sm).abs() > 0.8 {
+            self.note_sm = midi;
         } else {
-            self.note_sm += (basis - self.note_sm) * (1.0 - (-dt / tau_n).exp());
+            self.note_sm += (midi - self.note_sm) * (1.0 - (-dt / 0.010).exp());
         }
+        if (self.note_sm - self.centre).abs() > 1.2 {
+            self.centre = self.note_sm; // left the vibrato: follow at once
+        }
+        let keep = self.p.keep_vibrato;
+        // the note is always chosen on the centre: vibrato never flips it to a neighbour, in either
+        // mode (Vibrato On / Off only decides whether the vibrato itself is corrected away)
+        let basis = self.centre;
         let mut err = 0.0;
-        if self.pick_note(self.note_sm, basis, dt) {
-            err = self.cur_note as f64 - basis;
-            // the correction never needs to move the voice by an octave (that is Transpose's job):
-            // taken modulo 12, a detector octave slip or a register flip costs nothing instead of
-            // pulling the voice 12 st for a moment
+        if self.pick_note(basis, midi, dt) {
+            // Vibrato On: the centre goes onto the note and the singer's vibrato rides on top,
+            // scaled by Depth (0 flat, 1 as sung, 2 twice as wide). Off: the pitch itself is corrected.
+            err = if keep {
+                let d = (self.p.vib_amount as f64).clamp(0.0, 2.0);
+                self.cur_note as f64 - self.centre + (d - 1.0) * (midi - self.centre)
+            } else {
+                self.cur_note as f64 - midi
+            };
+            // the correction never needs to move the voice by an octave: taken modulo 12, a
+            // detector octave slip or a register flip costs nothing
             err -= 12.0 * (err / 12.0).round();
-            let fl = self.p.flex_cents as f64 / 100.0 * (1.0 - u);
-            err = if err > fl { err - fl } else if err < -fl { err + fl } else { 0.0 };
-            let amount = (self.p.amount as f64).clamp(0.0, 1.0);
-            err *= amount + (1.0 - amount) * u;
-            if (self.p.bypass_mask >> (self.cur_note.rem_euclid(12) as u32)) & 1 == 1 {
-                err = 0.0; // this note is flagged BYPASS: sing it as it is
+            err *= (self.p.amount as f64).clamp(0.0, 1.0);
+            let cn = self.cur_note as f32;
+            if self.states[self.cur_note.rem_euclid(12) as usize] == 5 || cn < self.p.range_lo || cn > self.p.range_hi {
+                err = 0.0; // BYPASS note, or outside the correction range: sung as it is
             }
         }
 
         // glide time: Note Transition while moving onto a newly selected note,
-        // Retune Speed for settling inside a note
-        let mut tau = if self.transition { self.p.transition_ms } else { self.p.retune_ms } as f64 / 1000.0;
-        if self.p.humanize > 0.0 {
-            tau *= 1.0 + self.p.humanize as f64 * (1.0 - u) * 4.0 * (1.0 - (err.abs() / 0.5).min(1.0));
-        }
-        tau *= (1.0 - u) * (1.0 - u);
+        // Speed for settling inside a note
+        let tau = if self.transition { self.p.transition_ms } else { self.p.retune_ms } as f64 / 1000.0;
         if tau < 0.0005 {
             self.corr_sm = err;
         } else {
@@ -1170,7 +1282,17 @@ impl Engine {
             vformant = vp.formant_semis;
         }
 
-        let hs = p / r;
+        // Output hop = the real distance to the next pitch mark (not the detector's period
+        // estimate) divided by the ratio: with no shift the grains then land exactly where they
+        // came from and the voice is rebuilt unchanged. With the estimate, grains drifted against
+        // the original, overlapped out of phase and periods were dropped / repeated even at
+        // ratio 1 - a rough, not-quite-live sound.
+        let d = if voiced {
+            self.mark_after(m).map(|n| (n - m) as f64).filter(|d| *d > 0.6 * p && *d < 1.6 * p).unwrap_or(p)
+        } else {
+            p
+        };
+        let hs = d / r;
         let hg = (p.max(hs).ceil() as i64).max(8);
         let follow = if self.p.formant_preserve { 0.0 } else { self.p.formant_follow as f64 };
         let s_raw = if self.p.formant_on { 2f64.powf((self.p.formant_semis + vformant) as f64 / 12.0) * r.powf(follow) } else { 1.0 };
@@ -1233,7 +1355,7 @@ impl Engine {
         // pitch marks (strong upward shift, hs < p), the nearest mark would be picked again and
         // again and the content would fall behind real time - so then advance the nominal
         // position by exactly one hop and let the mark picker repeat marks as needed.
-        let nom = if hs < 0.75 * p { sy.content_nom + hs } else { m as f64 + hs };
+        let nom = if hs < 0.75 * d { sy.content_nom + hs } else { m as f64 + hs };
         let lag_err = (sy.next_centre - self.latency as f64) - nom;
         sy.content_nom = nom + (self.pull * lag_err).clamp(-0.5 * hs, 0.5 * hs);
         sy.prev_hs = hs;
@@ -1446,9 +1568,12 @@ mod fuzz_tests {
                         p.retune_ms = xorshift(&mut seed) * 400.0;
                         p.transition_ms = xorshift(&mut seed) * 400.0;
                         p.amount = xorshift(&mut seed);
-                        p.flex_cents = xorshift(&mut seed) * 100.0;
-                        p.humanize = xorshift(&mut seed);
-                        p.natural_vib = xorshift(&mut seed);
+                        p.tol_cents = xorshift(&mut seed) * 40.0;
+                        p.tol_ms = xorshift(&mut seed) * 300.0;
+                        p.keep_vibrato = xorshift(&mut seed) > 0.5;
+                        p.vib_amount = xorshift(&mut seed) * 2.0;
+                        p.range_lo = xorshift(&mut seed) * 60.0 + 24.0;
+                        p.range_hi = p.range_lo + xorshift(&mut seed) * 50.0;
                         p.transpose = (xorshift(&mut seed) * 24.0 - 12.0).round();
                         p.fine_cents = xorshift(&mut seed) * 200.0 - 100.0;
                         p.formant_semis = xorshift(&mut seed) * 24.0 - 12.0;
@@ -1456,8 +1581,9 @@ mod fuzz_tests {
                         p.formant_mode = FormantMode::from_index((xorshift(&mut seed) * 5.0) as usize % 5);
                         p.formant_tilt = xorshift(&mut seed) * 2.0 - 1.0;
                         p.formant_follow = xorshift(&mut seed);
-                        p.tracking = xorshift(&mut seed);
-                        p.bypass_mask = (xorshift(&mut seed) * 4096.0) as u16;
+                        for n in p.note_override.iter_mut() {
+                            *n = (xorshift(&mut seed) * 6.0) as u8 % 6;
+                        }
                         p.vib_on = xorshift(&mut seed) > 0.5;
                         p.vib_shape = (xorshift(&mut seed) * 4.0) as usize % 4;
                         p.air_db = xorshift(&mut seed) * 18.0 - 6.0;
@@ -1564,28 +1690,26 @@ mod fuzz_tests {
         (out, lat)
     }
 
-    /// ULTRA at 100 %: a wobbly, vibrato-heavy voice comes out dead flat on the note,
-    /// and a note change becomes an instant step - even with slow Retune / Transition settings.
+    /// Vibrato handling: with Vibrato Off and Speed 0 a wobbly voice comes out dead flat on the note
+    /// and a note change is an instant step; with Vibrato On the note centre is corrected and the
+    /// singer's vibrato is kept (Depth 100 %), flattened (0 %) or widened (200 %).
     #[test]
-    fn ultra_is_flat_and_steps_instantly() {
+    fn vibrato_is_kept_or_flattened() {
         let fs = 48000.0;
-        // A3 with 45 cent vibrato + slow 25 cent drift, then at 1.5 s a jump to C4 with the same wobble
-        let curve = |t: f64| {
-            let base = if t < 1.5 { 57.0 } else { 60.0 };
-            base + 0.45 * (2.0 * PI * 5.5 * t).sin() + 0.25 * (2.0 * PI * 0.7 * t).sin()
+        // A3 + 35 c off, 40 c vibrato + slow 15 c drift; at 1.5 s a jump to C4 with the same wobble
+        let vib = |t: f64| 0.40 * (2.0 * PI * 5.5 * t).sin();
+        let curve = move |t: f64| {
+            let base = if t < 1.5 { 57.35 } else { 60.3 };
+            base + vib(t) + 0.15 * (2.0 * PI * 0.7 * t).sin()
         };
         let x = sung(fs, curve, 3.0);
-        let mut p = Params::default();
-        p.scale = 0;
-        p.retune_ms = 250.0;
-        p.transition_ms = 250.0;
-        p.natural_vib = 1.0;
-        let dev = |out: &[f32], lat: usize, from: f64, to: f64, note: f64| -> (f64, f64) {
+        // deviation of the output from note + k * vibrato
+        let dev = |out: &[f32], lat: usize, from: f64, to: f64, note: f64, k: f64| -> (f64, f64) {
             let (mut max, mut sum, mut n) = (0.0f64, 0.0f64, 0);
             let mut t = from;
             while t < to {
                 let m = pitch_at(out, (t * fs) as usize + lat, fs);
-                let d = (m - note).abs();
+                let d = (m - note - k * vib(t)).abs();
                 max = max.max(d);
                 sum += d;
                 n += 1;
@@ -1593,22 +1717,33 @@ mod fuzz_tests {
             }
             (max * 100.0, sum / n as f64 * 100.0)
         };
-        p.ultra = 1.0;
-        let (u, lat) = run_engine(fs, &x, &p);
-        let (umax1, uavg1) = dev(&u, lat, 0.4, 1.4, 57.0);
-        let (umax2, uavg2) = dev(&u, lat, 1.6, 2.9, 60.0);
-        p.ultra = 0.0;
-        let (n, _) = run_engine(fs, &x, &p);
-        let (nmax, navg) = dev(&n, lat, 0.4, 1.4, 57.0);
-        println!("ULTRA: max {umax1:.1} c avg {uavg1:.1} c | after step max {umax2:.1} c avg {uavg2:.1} c | normal: max {nmax:.1} c avg {navg:.1} c");
-        assert!(umax1 < 12.0 && uavg1 < 4.0, "ULTRA not flat: max {umax1:.1} c avg {uavg1:.1} c");
-        assert!(umax2 < 12.0 && uavg2 < 4.0, "ULTRA not flat after the step: max {umax2:.1} avg {uavg2:.1}");
-        assert!(navg > 3.0 * uavg1, "normal mode should keep much more of the wobble");
-        // step: 60 ms after the input jumps, the output is already on C4
-        let m = pitch_at(&u, ((1.5 + 0.06) * fs) as usize + lat, fs);
+        let mut p = Params::default();
+        p.scale = 0;
+        // hard: vibrato off, speed 0
+        p.keep_vibrato = false;
+        p.retune_ms = 0.0;
+        p.transition_ms = 0.0;
+        let (h, lat) = run_engine(fs, &x, &p);
+        let (hmax, havg) = dev(&h, lat, 0.4, 1.4, 57.0, 0.0);
+        let (hmax2, havg2) = dev(&h, lat, 1.6, 2.9, 60.0, 0.0);
+        // the jump lands on a vibrato peak (~+0.8 st): give the centre a moment
+        let m = pitch_at(&h, ((1.5 + 0.2) * fs) as usize + lat, fs);
+        println!("Vibrato Off, Speed 0: flat within max {hmax:.1} c avg {havg:.1} c, after the step {hmax2:.1} / {havg2:.1} c, 200 ms after the jump {m:.2}");
+        assert!(hmax < 12.0 && havg < 4.0 && hmax2 < 12.0 && havg2 < 4.0, "hard mode not flat");
         assert!((m - 60.0).abs() < 0.15, "step too slow: {m:.2}");
+        // natural: vibrato on, default speed / transition; depth 100 / 0 / 200 %
+        p = Params::default();
+        p.scale = 0;
+        // (Depth 0 at the default Speed of 15 ms: the correction trails a 5.5 Hz vibrato a little)
+        for (depth, limit) in [(1.0f32, 9.0), (0.0, 14.0), (2.0, 20.0)] {
+            p.vib_amount = depth;
+            let (y, lat) = run_engine(fs, &x, &p);
+            let (mx, avg) = dev(&y, lat, 0.5, 1.4, 57.0, depth as f64);
+            let (mx2, avg2) = dev(&y, lat, 1.8, 2.9, 60.0, depth as f64);
+            println!("Vibrato On, depth {:.0} %: output = note + {:.0} % vibrato within avg {avg:.1} c (max {mx:.1}), after the step {avg2:.1} c (max {mx2:.1})", depth * 100.0, depth * 100.0);
+            assert!(avg < limit && avg2 < limit, "vibrato depth {depth}: avg error {avg:.1} / {avg2:.1} c");
+        }
     }
-
 
     /// The voice-range switch must not cap high notes: a "Bass" setting still tunes A4 and D5.
     #[test]
@@ -1717,47 +1852,6 @@ mod fuzz_tests {
         }
     }
 
-    /// Switching ULTRA off really brings back the normal behaviour (vibrato comes back).
-    #[test]
-    fn ultra_off_restores_normal_behaviour() {
-        let fs = 48000.0;
-        let curve = |t: f64| 57.0 + 0.4 * (2.0 * PI * 5.5 * t).sin();
-        let x = sung(fs, curve, 3.0);
-        let measure = |switch_at: Option<f64>| -> f64 {
-            let mut p = Params::default();
-            p.scale = 0;
-            p.retune_ms = 120.0;
-            p.natural_vib = 1.0;
-            let mut e = Engine::new(fs, 70.0);
-            let lat = e.latency_samples() as usize;
-            let mut out = Vec::with_capacity(x.len());
-            for (i, ch) in x.chunks(128).enumerate() {
-                let t = i as f64 * 128.0 / fs;
-                p.ultra = match switch_at {
-                    Some(s) if t < s => 1.0,
-                    _ => 0.0,
-                };
-                e.set_params(&p);
-                for &v in ch {
-                    out.push(e.process_frame([v, v], 1)[0]);
-                }
-            }
-            let (mut sum, mut n) = (0.0, 0);
-            let mut t = 2.0;
-            while t < 2.9 {
-                sum += (pitch_at(&out, (t * fs) as usize + lat, fs) - 57.0).abs();
-                n += 1;
-                t += 0.01;
-            }
-            sum / n as f64 * 100.0
-        };
-        let normal = measure(None);
-        let after = measure(Some(1.5));
-        println!("vibrato kept: normal {normal:.1} c, 0.5 s after switching ULTRA off {after:.1} c");
-        assert!(normal > 10.0, "test voice should keep vibrato in normal mode");
-        assert!((after - normal).abs() < 0.2 * normal, "ULTRA still active after switching off: {after:.1} vs {normal:.1}");
-    }
-
     /// A voice wobbling right between two notes must not flicker back and forth between them.
     #[test]
     fn note_choice_does_not_flicker() {
@@ -1766,12 +1860,13 @@ mod fuzz_tests {
         let jit: Vec<f64> = (0..400).map(|_| (xorshift(&mut seed) as f64 - 0.5) * 0.22).collect();
         // sits at 57.5 (between A3 and A#3) with fast random jitter of +-11 cents
         let x = sung(fs, |t| 57.5 + jit[((t * 120.0) as usize).min(399)], 3.0);
-        for (ultra, tracking) in [(0.0f32, 0.0f32), (0.0, 0.22), (1.0, 0.22)] {
+        for (keep, tol_c, tol_ms, limit) in [(false, 0.0f32, 0.0f32, 12usize), (false, 20.0, 0.0, 3), (false, 0.0, 100.0, 3), (true, 20.0, 0.0, 3), (true, 0.0, 100.0, 3)] {
             let mut e = Engine::new(fs, 70.0);
             let mut p = Params::default();
             p.scale = 0;
-            p.ultra = ultra;
-            p.tracking = tracking;
+            p.keep_vibrato = keep;
+            p.tol_cents = tol_c;
+            p.tol_ms = tol_ms;
             let mut switches = 0;
             let mut last = 0.0f32;
             for (i, ch) in x.chunks(128).enumerate() {
@@ -1787,10 +1882,10 @@ mod fuzz_tests {
                     last = t;
                 }
             }
-            println!("ultra {ultra} tracking {tracking}: {switches} note switches in 2.7 s");
-            // Tracking 0 is asked to follow every quick move; everything else must stay put
-            let limit = if tracking == 0.0 { 10 } else { 3 };
-            assert!(switches <= limit, "flicker: {switches} switches (ultra {ultra}, tracking {tracking})");
+            println!("vibrato {keep} tolerance {tol_c} c / {tol_ms} ms: {switches} note switches in 2.7 s");
+            // without any tolerance the target follows the nearest note (a voice right on the
+            // border may switch); any tolerance must hold it
+            assert!(switches <= limit, "flicker: {switches} switches (vibrato {keep}, tolerance {tol_c} c / {tol_ms} ms)");
         }
     }
 
@@ -1806,13 +1901,13 @@ mod fuzz_tests {
             let i = ((t / 0.6) as usize).min(seq.len() - 1);
             seq[i].0 + 0.12 * (2.0 * PI * 5.5 * t).sin()
         }, 0.6 * seq.len() as f64);
-        for tracking in [0.0f32, 0.22, 0.6, 1.0] {
-            for ultra in [0.0f32, 1.0] {
+        for tol_ms in [0.0f32, 50.0, 150.0] {
+            for keep in [false, true] {
                 let mut e = Engine::new(fs, 70.0);
                 let mut p = Params::default();
                 p.scale = 0;
-                p.tracking = tracking;
-                p.ultra = ultra;
+                p.tol_ms = tol_ms;
+                p.keep_vibrato = keep;
                 let mut wrong = Vec::new();
                 for (i, ch) in x.chunks(128).enumerate() {
                     e.set_params(&p);
@@ -1821,8 +1916,8 @@ mod fuzz_tests {
                     }
                     let t = i as f64 * 128.0 / fs;
                     let k = (t / 0.6) as usize;
-                    // judge the last 0.3 s of every held note
-                    if k < seq.len() && t - k as f64 * 0.6 > 0.3 {
+                    // judge the end of every held note (Tolerance Time delays the switch on purpose)
+                    if k < seq.len() && t - k as f64 * 0.6 > 0.3 + tol_ms as f64 / 1000.0 * 0.6 {
                         let tg = e.meters.target as i32;
                         if tg != seq[k].1 {
                             wrong.push((k, tg));
@@ -1830,8 +1925,8 @@ mod fuzz_tests {
                     }
                 }
                 wrong.dedup();
-                println!("tracking {tracking} ultra {ultra}: wrong {:?}", wrong);
-                assert!(wrong.is_empty(), "tracking {tracking} ultra {ultra}: held notes on the wrong note {:?}", wrong);
+                println!("tolerance time {tol_ms} ms vibrato {keep}: wrong {:?}", wrong);
+                assert!(wrong.is_empty(), "tolerance {tol_ms} ms vibrato {keep}: held notes on the wrong note {:?}", wrong);
             }
         }
     }
@@ -1877,14 +1972,14 @@ mod fuzz_tests {
                 base + 0.2 * smooth((tau - 0.12) / 0.08) * (2.0 * PI * 5.5 * tau).sin()
             };
             let x = sung(fs, curve, dur * notes.len() as f64);
-            for (tracking, ultra, retune) in [(0.0f32, 0.0f32, 0.0f32), (0.22, 0.0, 50.0), (0.22, 0.0, 0.0), (0.6, 0.0, 0.0), (1.0, 0.0, 0.0), (0.22, 1.0, 50.0), (1.0, 1.0, 50.0)] {
+            for (tol_ms, keep, retune) in [(0.0f32, false, 0.0f32), (0.0, false, 15.0), (0.0, true, 15.0), (0.0, true, 0.0), (60.0, false, 0.0), (120.0, true, 15.0)] {
                 let mut e = Engine::new(fs, 70.0);
                 let lat = e.latency_samples() as usize;
                 let mut p = Params::default();
                 p.scale = scale;
                 p.key = key;
-                p.tracking = tracking;
-                p.ultra = ultra;
+                p.tol_ms = tol_ms;
+                p.keep_vibrato = keep;
                 p.retune_ms = retune;
                 p.transition_ms = retune;
                 let mut out = Vec::with_capacity(x.len());
@@ -1939,17 +2034,17 @@ mod fuzz_tests {
                             }
                         }
                     }
-                    if retune == 0.0 || ultra == 1.0 {
+                    if retune == 0.0 && !keep {
                         let m = pitch_at(&out, ((t0 + 0.3) * fs) as usize + lat, fs);
                         if (m - b as f64).abs() > 0.1 {
                             off_out.push((k, b, ((m - b as f64) * 100.0).round() as i32));
                         }
                     }
                 }
-                let line = format!("seed {seed0} scale {scale} key {key} tracking {tracking} ultra {ultra} retune {retune}: settle {:.0} ms, outside span {:?}, stairs {:?}, unsettled {:?}, output off {:?}",
+                let line = format!("seed {seed0} scale {scale} key {key} tolerance {tol_ms} ms vibrato {keep} speed {retune}: settle {:.0} ms, outside span {:?}, stairs {:?}, unsettled {:?}, output off {:?}",
                     worst_settle * 1000.0, bad_span, stairs, unsettled, off_out);
                 println!("{line}");
-                let limit = 0.07 + 0.09 * tracking as f64;
+                let limit = 0.09 + tol_ms as f64 / 1000.0 + if keep { 0.03 } else { 0.0 };
                 if !bad_span.is_empty() || !stairs.is_empty() || !unsettled.is_empty() || !off_out.is_empty() || worst_settle > limit {
                     report.push(line);
                 }
@@ -1982,12 +2077,12 @@ mod fuzz_tests {
             a + (b - a) * sl + over + jit[((t * 200.0) as usize).min(1999)] + 0.15 * (2.0 * PI * 5.5 * t).sin()
         };
         let x = sung(fs, curve, dur * pts.len() as f64);
-        for (scale, tracking) in [(0usize, 0.22f32), (0, 1.0), (2, 0.22), (2, 1.0)] {
+        for (scale, keep) in [(0usize, false), (0, true), (2, false), (2, true)] {
             let mut e = Engine::new(fs, 70.0);
             let mut p = Params::default();
             p.scale = scale;
             p.key = 5;
-            p.tracking = tracking;
+            p.keep_vibrato = keep;
             p.retune_ms = 0.0;
             p.transition_ms = 0.0;
             let lim = if scale == 0 { 1.6 } else { 2.1 };
@@ -2007,8 +2102,8 @@ mod fuzz_tests {
                 }
             }
             let ms = worst as f64 * 64.0 / fs * 1000.0;
-            println!("scale {scale} tracking {tracking}: longest pull > {lim} st: {ms:.0} ms (max {maxc:.2} st)");
-            assert!(ms <= 20.0, "scale {scale} tracking {tracking}: pulled > {lim} st for {ms:.0} ms (max {maxc:.2} st)");
+            println!("scale {scale} vibrato {keep}: longest pull > {lim} st: {ms:.0} ms (max {maxc:.2} st)");
+            assert!(ms <= 20.0, "scale {scale} vibrato {keep}: pulled > {lim} st for {ms:.0} ms (max {maxc:.2} st)");
         }
     }
 
@@ -2023,12 +2118,12 @@ mod fuzz_tests {
         for f in &files {
             let raw = std::fs::read(f).unwrap();
             let x: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-            for (scale, tracking) in [(0usize, 0.22f32), (0, 1.0), (2, 0.22), (2, 1.0)] {
+            for (scale, keep) in [(0usize, false), (0, true), (2, false), (2, true)] {
                 let mut e = Engine::new(48000.0, 70.0);
                 let mut p = Params::default();
                 p.scale = scale;
                 p.key = 5;
-                p.tracking = tracking;
+                p.keep_vibrato = keep;
                 p.retune_ms = 0.0;
                 p.transition_ms = 0.0;
                 let lim = if scale == 0 { 1.6 } else { 2.1 };
@@ -2050,7 +2145,7 @@ mod fuzz_tests {
                     }
                 }
                 let ms = worst as f64 * 64.0 / 48.0;
-                let line = format!("{} scale {scale} tracking {tracking}: longest pull > {lim} st {ms:.0} ms, max {maxc:.2} st", f.file_name().unwrap().to_string_lossy());
+                let line = format!("{} scale {scale} vibrato {keep}: longest pull > {lim} st {ms:.0} ms, max {maxc:.2} st", f.file_name().unwrap().to_string_lossy());
                 println!("{line}");
                 if ms > 25.0 || maxc > 6.0 {
                     report.push(line);
@@ -2058,6 +2153,43 @@ mod fuzz_tests {
             }
         }
         assert!(report.is_empty(), "{}", report.join("\n"));
+    }
+
+    /// With no correction (Amount 0) the voice must come out as it went in: grains laid back exactly
+    /// where they came from. Placing them by the period estimate instead drifted them against the
+    /// original (lags wandering by several ms, periods dropped / repeated) - a rough sound.
+    #[test]
+    fn no_correction_is_transparent() {
+        let fs = 48000.0;
+        let x = sung(fs, |t| 57.0 + 0.3 * (2.0 * PI * 5.0 * t).sin() + 2.0 * (t / 3.0).min(1.0), 3.0);
+        let mut p = Params::default();
+        p.scale = 0;
+        p.amount = 0.0;
+        let (y, lat) = run_engine(fs, &x, &p);
+        let w = 1920usize;
+        let mut snrs = Vec::new();
+        let mut s0 = 24000usize;
+        while s0 + w + 400 < x.len() - 2000 {
+            let a = &x[s0..s0 + w];
+            let ea: f64 = a.iter().map(|v| (*v as f64).powi(2)).sum();
+            let mut best = -99.0f64;
+            for lag in -400i64..=400 {
+                let o = (s0 as i64 + lat as i64 + lag) as usize;
+                let b = &y[o..o + w];
+                let ab: f64 = a.iter().zip(b).map(|(u, v)| *u as f64 * *v as f64).sum();
+                let bb: f64 = b.iter().map(|v| (*v as f64).powi(2)).sum();
+                let g = ab / bb.max(1e-12);
+                let e: f64 = a.iter().zip(b).map(|(u, v)| (*u as f64 - g * *v as f64).powi(2)).sum();
+                best = best.max(10.0 * (ea / e.max(1e-12)).log10());
+            }
+            snrs.push(best);
+            s0 += w;
+        }
+        snrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = snrs[snrs.len() / 2];
+        let low = snrs[snrs.len() / 10];
+        println!("Amount 0: per-40 ms match with the input: median {med:.1} dB, p10 {low:.1} dB");
+        assert!(med > 30.0 && low > 20.0, "not transparent: median {med:.1} dB, p10 {low:.1} dB");
     }
 
     /// Switching modules on and off while singing must not click.

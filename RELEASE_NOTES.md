@@ -1,3 +1,14 @@
+## NyashkTune 2.0.0
+
+Rebuilt around the controls and the logic of a classic real-time tuner. Everything else is gone.
+
+- **Controls:** Speed (default 15 ms) and Note Transition (120 ms) with Link; **Tolerance** in cents (Off–40) and time (Off–300 ms); **Vibrato** On / Off with **Depth** 0–200 %; **Correction** On / Off and amount; **Formant** Corrected / Non-corrected; Reference ±100 cents; Root, Scale, Reset Scale, Voice range, MIDI target.
+- **Keyboard** with note states for every note: Legal, Illegal, Illegal – pitch up, Illegal – pitch down, Bypass; the correction **range** is dragged on the keyboard, notes outside it pass uncorrected.
+- **Natural by default:** with Vibrato On only the note centre is corrected and the singer's own vibrato is kept (or flattened / widened with Depth). The note is always chosen on the vibrato-free centre, so a wide vibrato never flips it to a neighbour - in either mode.
+- **Cleaner sound:** the resynthesis lays every grain at the real distance to the next pitch mark. Before, grains drifted against the original even with no correction (periods dropped / repeated, a rougher sound); with no correction the voice now comes out as it went in (~50 dB instead of ~28 dB match).
+- **Removed:** ULTRA, harmony voices, Air / Drive, the synthetic vibrato, formant shift and its algorithms, Flex-Tune, Humanize, Transpose / Detune, Mix, Gate, input / output gain, the preset browser and the pitch graph. New correction meter (arc, cents) with the target note, IN / OUT meters.
+- Old projects: Root, Scale, Speed, Note Transition, Link, Amount, Reference and MIDI target load; the rest starts from the new defaults.
+
 ## NyashkTune 1.1.4
 
 - **No more horrible jumps and broken sound.** On a fast slide of the voice, after a leap, or when the pitch detector slipped an octave, the tuner kept the old note for tens of milliseconds and pulled the voice 2-5 semitones away, sometimes a whole octave (12 st). With Retune 0 this was heard as a gargled, broken sound and as the tall spikes on the display. Now the tuner never pulls the voice further than its nearest note for more than ~12 ms, and an octave slip costs nothing (the correction never moves the voice by a whole octave).

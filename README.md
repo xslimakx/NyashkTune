@@ -2,7 +2,7 @@
 
 # NyashkTune
 
-NyashkTune is a realtime vocal pitch correction (autotune) VST3 plugin.
+NyashkTune is a real-time vocal pitch correction VST3 plugin.
 
 [![Build](https://github.com/xslimakx/NyashkTune/actions/workflows/build.yml/badge.svg)](https://github.com/xslimakx/NyashkTune/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -15,90 +15,30 @@ NyashkTune is a realtime vocal pitch correction (autotune) VST3 plugin.
 
 ---
 
-## 🎶 NyashkTune — autotune
+## 🎶 NyashkTune — real-time pitch correction
 
-Realtime vocal pitch correction, from transparent, natural-sounding tuning to the hard T-Pain effect.
+Real-time vocal pitch correction with the controls of a classic real-time tuner, from transparent tuning that keeps the singer's own vibrato to a hard quantized effect.
 
-<p align="center"><img src="docs/img/nyashktune-tune.png" alt="NyashkTune - TUNE tab" width="820"></p>
-<p align="center"><img src="docs/img/nyashktune-formant.png" alt="FORMANT tab" width="410"> <img src="docs/img/nyashktune-voices.png" alt="VOICES tab" width="410"></p>
-<p align="center"><img src="docs/img/nyashktune-presets.png" alt="Preset browser" width="410"> </p>
+<p align="center"><img src="docs/img/nyashktune-tune.png" alt="NyashkTune" width="820"></p>
 
-### Features
+### Controls
 
 | | |
 |---|---|
-| **Pitch detection** | YIN with continuity tracking (no octave jumps), centred in time |
-| **Resynthesis** | PSOLA on pitch marks, mono/stereo |
-| **Scales** | 16 scales + **Custom** (click notes C…B), key, Ref A4 (415–466 Hz) |
-| **Per-note BYPASS** | Right-click a note: it is allowed as a target but sung exactly as it is (blue-note / slide friendly) |
-| **ULTRA** | Switch + amount: MIDI-like hard steps between notes, dead flat on the note (no glide, vibrato or drift). Off = normal behaviour |
-| **Note names** | Sharps and flats: every black key shows both, the ♯ / ♭ switch picks the spelling used everywhere |
-| **Character** | Retune Speed (0 = hard T-Pain), Note Transition, **LINK**, Amount, Flex-Tune, Humanize, Natural Vibrato, **Tracking** (how reluctantly it jumps to another note) |
-| **Vibrato** | Synthetic vibrato: Depth / Rate / Delay, shapes Sine / Triangle / Saw / Wander |
-| **MIDI Target** | Tunes to the notes you play on a MIDI keyboard |
-| **Timbre** | Transpose (±12 st), Detune (±100 c), **Formant Shift** with 5 algorithms, Tilt, Follow, Keep Formants |
-| **Voices** | 2 extra voices (harmony / octave / double): interval, scale-aware snapping, level, pan, detune, formant, delay |
-| **Colour** | Air (7 kHz shelf) and Drive (soft saturation) on the processed voice |
-| **Voice range** | Generic, Bass, Baritone, Tenor, Alto, Mezzo-Soprano, Soprano, Instrument |
-| **Your presets** | **SAVE** stores every setting under your own name and category (any language / symbols) in the preset browser. Files: `~/.config/NyashkTune/presets` (Linux), `%APPDATA%\\NyashkTune\\presets` (Windows), `~/Library/Application Support/NyashkTune/presets` (macOS) - copy them to share |
-| **Switch off what you don't need** | the module switches on the tab bar - **FORMANT**, **VOICES** (master) and each voice **ON**, **COLOUR** (Air/Drive), **VIBRATO**: when off the stage is skipped completely (no CPU) - plain pitch correction only needs the TUNE tab |
-| **Other** | 29 presets (incl. **Anime Vocal**), full automation, state recall, resizable window |
+| **Speed** | How fast a sustained note is pulled onto the target and held there (0.1–800 ms, default 15 ms). |
+| **Note Transition** | How fast the correction moves when the target note changes (0.1–800 ms, default 120 ms). **Link** moves both together. |
+| **Tolerance** | **Cents** (Off–40): extra margin beyond the 50 c border between notes before the target changes. **Time** (Off–300 ms): how long the voice must stay past it. Off / Off = straight to the nearest legal note. |
+| **Vibrato** | **On** (default): only the note centre is corrected and the singer's own vibrato is kept, scaled by **Depth** (0 % flat, 100 % as sung, 200 % twice as wide). **Off**: the whole pitch is corrected (with fast Speed / Transition: the hard quantized effect). |
+| **Correction** | On / Off and the amount (1–100 %) of the correction applied. |
+| **Formant** | **Corrected** keeps the natural timbre while shifting; **Non-corrected** lets it follow the pitch (pitch-shifter character). |
+| **Reference** | A4 from 415.3 to 466.16 Hz (±100 cents), e.g. for a sped-up beat. |
+| **Keyboard** | Click the strip above a key to cycle the note's state (all octaves): **Legal**, **Illegal** (to the nearest legal note), **Illegal – pitch up / down** (to the next legal note in that direction), **Bypass** (legal, left as sung). Drag the two orange edges to set the correction **range** – notes outside it pass uncorrected. The sung note (dot) and the target note are shown live. |
+| **Root / Scale** | Root C–B with ♭ / ♯, 16 scales + Custom (all illegal, set the keys yourself). A hand-edited keyboard shows `*` after the scale name; **Reset** goes back to the scale. |
+| **Voice** | Generic, Bass, Baritone, Tenor, Alto, Mezzo-Soprano, Soprano: sets the range. |
+| **MIDI** | The notes held on the plugin's MIDI input are the legal notes. |
+| **Meter** | The arc shows the correction applied in cents and the target note; IN / OUT peak meters. |
 
-### Preset browser
-
-`<` name `>` flips through presets, clicking the name opens the browser: categories, search, favourites, 1-5 star ratings, factory + your own presets. **SAVE** (header) opens it with the save line: name + category -> **SAVE**. Each category is a folder inside the presets folder. Click one of your presets to select it: **DELETE** removes the file (an emptied category folder disappears too), **OPEN FOLDER** shows the preset folder in your file manager, **RESCAN** reloads it.
-
-### Latency
-
-Latency comes only from the pitch detector (the Voice Range sets it), not from formant / voices / colour: switching those on or off does not change it.
-
-### Formant algorithms
-
-Formant shifting sounds different in every tool, so the algorithm is selectable (FORMANT tab, with a live "where does a formant go" map):
-
-| Algorithm | What it does |
-|---|---|
-| **Classic** | Every grain is resampled (the original PSOLA way). Cheap, solid, even shift. |
-| **Smooth** | Spectral: a broad spectral envelope is moved, fine structure stays. Most natural, hardest to break. |
-| **Detailed** | Spectral: sharper envelope keeps vowel detail and presence. Clear, "pro" sounding. |
-| **Vocal (LPC)** | Spectral: all-pole vocal-tract model (16 kHz-style LPC). Peaky, singer-like resonances. |
-| **Bend** | Spectral: warps the formant *spacing* around 400 Hz instead of sliding everything - stretches or squeezes the tract. |
-
-**Tilt** moves the high formants more (+) or the low ones more (−) in the spectral algorithms; **Follow** (with Keep Formants off) decides how much the formants follow the pitch correction.
-
-<details>
-<summary><b>Scales</b></summary>
-
-Chromatic · Major · Natural Minor · Harmonic Minor · Melodic Minor · Major Pentatonic · Minor Pentatonic · Blues · Dorian · Phrygian · Lydian · Mixolydian · Locrian · Whole Tone · Diminished · Arabic (Hijaz) · Custom
-
-</details>
-
-<details>
-<summary><b>Presets</b></summary>
-
-Init (Major, 50 ms) · Natural Correction · Transparent Pop · Smooth R&B · Hard Tune (T-Pain) · Hard Tune Major · Minor Pentatonic Rap · Robot Voice · Gender Up · Gender Down · Add Vibrato · MIDI Target · **Anime Vocal** · Anime Vocal - Soft · Anime Vocal - Hyper · Anime Idol (Duet Layers) · Chipmunk · Giant / Demon · Robot Choir · Octave Doubler · Thirds Harmony · Gospel Choir · Stereo Double (ADT) · Alien Throat · Wobbly Vibrato · Telephone Singer · Whisper Child · Formant Lab (LPC +3)
-
-The *Anime* presets are a bright, small-vocal-tract starting point (formants up, fast tune, airy top, an octave shimmer and a detuned double). Set KEY / SCALE for your song and trim Shift / Transpose to taste.
-
-</details>
-
-### Retune Speed / Note Transition / LINK
-
-- **Retune Speed** — how fast the pitch settles onto the note while you hold it.
-- **Note Transition** — glide time when the note changes (or a new note starts). `0` = instant jump.
-- **LINK** — moves both knobs together by the same amount, keeping the offset between them.
-
-The window is resizable: drag the grip in the bottom-right corner and the whole UI scales proportionally.
-
-### Latency (table)
-
-The plugin reports its latency to the host, so your DAW compensates for it automatically:
-
-| Voice Range | Latency |
-|---|---|
-| Low | ≈ 38 ms |
-| Mid | ≈ 27 ms |
-| High | ≈ 15 ms |
+The note is always chosen on the note centre (vibrato taken out, from the last vibrato peak and trough), so a wide vibrato never flips the target to a neighbouring note. Whatever the Tolerance, the tuner never pulls the voice further than its own target for more than ~12 ms, and never by a whole octave.
 
 ### How it works
 
@@ -108,13 +48,13 @@ input → high-pass → decimate → YIN (with continuity) → pitch frames (eve
       → PSOLA grain synthesiser: for every output grain
           1. pick the analysis mark that continues the previous one,
           2. look up the pitch at that moment of the audio (centred median of frames),
-          3. decide target note + retune smoothing → pitch ratio,
-          4. overlap-add a Hann grain at the new spacing
-             (spectral formant algorithms: FFT the grain, estimate its envelope,
-              multiply by E(f/s)/E(f), inverse FFT - phase and pitch structure untouched)
+          3. note centre (vibrato removed) → target note by the note states and Tolerance,
+             correction with Speed / Note Transition, vibrato kept or flattened,
+          4. overlap-add a Hann grain; the hop is the real distance to the next pitch mark
+             divided by the ratio, so with no correction the voice is rebuilt unchanged
 ```
 
-Because the audio is delayed by `latency` samples, step 2 sees pitch measurements from both before and after the grain, which makes decisions much steadier than a purely causal tracker. Formants stay put because every grain keeps its own spectral envelope; the extra voices are more grains from the same analysis, placed at their own pitch.
+The latency (≈ 27–37 ms, reported to the host) comes from the pitch detector and depends on the lowest note of the range.
 
 ---
 
@@ -130,7 +70,7 @@ Download the archive for your OS from [Releases](https://github.com/xslimakx/Nya
 
 ## Building from source
 
-Needs [Rust](https://rustup.rs/) (stable). `cargo test -p nyashktune` runs the DSP unit tests (FFT, formant movement, fuzzing of all parameters, key detection). Linux: `libasound2-dev libgl-dev libx11-xcb-dev libxcb1-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-dri2-0-dev`.
+Needs [Rust](https://rustup.rs/) (stable). `cargo test -p nyashktune` runs the DSP tests (transitions, vibrato, tolerance, transparency, fuzzing of all parameters). `NYASHK_VOICE_DIR=folder` adds a check on your own recordings (raw mono f32, 48 kHz). Linux: `libasound2-dev libgl-dev libx11-xcb-dev libxcb1-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-dri2-0-dev`.
 
 ```bash
 git clone https://github.com/xslimakx/NyashkTune.git

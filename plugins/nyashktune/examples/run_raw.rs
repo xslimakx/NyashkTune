@@ -1,6 +1,6 @@
 //! Offline harness: run the tuner engine over a raw mono f32 file at 48 kHz.
 //! usage: run_raw in.f32 out.f32 trace.csv [key=val ...]
-//! keys: key scale tracking ultra retune transition amount humanize flex natvib min max refa
+//! keys: key scale retune transition amount tolc tolms vib vibdepth min max refa
 //! writes the output aligned to the input (latency removed) and per-64-sample state:
 //! t, voiced, detected_hz, target_midi, correction_semis
 use nyashktune::engine::{Engine, Params};
@@ -17,14 +17,13 @@ fn main() {
         match k {
             "key" => p.key = f as usize,
             "scale" => p.scale = f as usize,
-            "tracking" => p.tracking = f,
-            "ultra" => p.ultra = f,
+            "tolc" => p.tol_cents = f,
+            "tolms" => p.tol_ms = f,
+            "vib" => p.keep_vibrato = f > 0.5,
+            "vibdepth" => p.vib_amount = f,
             "retune" => p.retune_ms = f,
             "transition" => p.transition_ms = f,
             "amount" => p.amount = f,
-            "humanize" => p.humanize = f,
-            "flex" => p.flex_cents = f,
-            "natvib" => p.natural_vib = f,
             "min" => p.min_hz = f,
             "max" => p.max_hz = f,
             "refa" => p.ref_a = f,

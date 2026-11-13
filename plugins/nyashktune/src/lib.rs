@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 pub mod engine;
 pub mod formant;
-mod browse;
 mod editor;
 
 // ------------------------------------------------------------------------------------------
@@ -93,45 +92,47 @@ pub enum VoiceRange {
     Tenor,
     #[name = "Alto"]
     Alto,
-    #[name = "Mezzo-Sop."]
+    #[name = "Mezzo-Soprano"]
     Mezzo,
     #[name = "Soprano"]
     Soprano,
-    #[name = "Instrument"]
-    Instrument,
 }
 
-/// How the formants are shifted (see `formant.rs`).
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum FormantAlgo {
-    #[name = "Classic"]
-    Classic,
-    #[name = "Smooth"]
-    Smooth,
-    #[name = "Detailed"]
-    Detailed,
-    #[name = "Vocal (LPC)"]
-    Lpc,
-    #[name = "Bend"]
-    Bend,
-}
-
-impl FormantAlgo {
-    pub fn to_string_name(self) -> &'static str {
-        Self::variants()[self.to_index()]
+impl VoiceRange {
+    /// Correction range (MIDI notes) of each voice type.
+    pub fn notes(self) -> (i32, i32) {
+        match self {
+            VoiceRange::Generic => (36, 84),  // C2 .. C6
+            VoiceRange::Bass => (36, 64),     // C2 .. E4
+            VoiceRange::Baritone => (40, 67), // E2 .. G4
+            VoiceRange::Tenor => (45, 72),    // A2 .. C5
+            VoiceRange::Alto => (50, 77),     // D3 .. F5
+            VoiceRange::Mezzo => (53, 81),    // F3 .. A5
+            VoiceRange::Soprano => (57, 86),  // A3 .. D6
+        }
     }
 }
 
+/// What a key of the keyboard does (clicking the strip above it cycles the states).
 #[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum VibShape {
-    #[name = "Sine"]
-    Sine,
-    #[name = "Triangle"]
-    Triangle,
-    #[name = "Saw"]
-    Saw,
-    #[name = "Wander"]
-    Wander,
+pub enum NoteState {
+    /// as the Root / Scale say (legal in the scale, illegal outside)
+    #[name = "Scale"]
+    Scale,
+    #[name = "Legal"]
+    Legal,
+    /// corrected to the nearest legal note
+    #[name = "Illegal"]
+    Illegal,
+    /// corrected up to the next legal note
+    #[name = "Illegal - Pitch Up"]
+    Up,
+    /// corrected down to the next legal note
+    #[name = "Illegal - Pitch Down"]
+    Down,
+    /// legal, but left as it is sung
+    #[name = "Bypass"]
+    Bypass,
 }
 
 // ------------------------------------------------------------------------------------------
@@ -140,318 +141,231 @@ pub enum VibShape {
 
 #[derive(Params)]
 pub struct NoteParam {
-    #[id = "on"]
-    pub on: BoolParam,
+    #[id = "st"]
+    pub state: EnumParam<NoteState>,
 }
 
-/// One extra voice (harmony / double) sung next to the corrected lead.
-#[derive(Params)]
-pub struct VoiceParam {
-    #[id = "von"]
-    pub on: BoolParam,
-    #[id = "int"]
-    pub interval: FloatParam,
-    #[id = "snap"]
-    pub snap: BoolParam,
-    #[id = "lvl"]
-    pub level: FloatParam,
-    #[id = "pan"]
-    pub pan: FloatParam,
-    #[id = "det"]
-    pub detune: FloatParam,
-    #[id = "fmt"]
-    pub formant: FloatParam,
-    #[id = "dly"]
-    pub delay: FloatParam,
+/// 0.1 .. 800 ms, close to logarithmic
+fn ms_range() -> FloatRange {
+    FloatRange::Skewed { min: 0.1, max: 800.0, factor: FloatRange::skew_factor(-2.6) }
 }
 
-impl VoiceParam {
-    fn new(i: usize) -> Self {
-        let n = i + 1;
-        let defaults = [(4.0, -8.0, -60.0), (-5.0, -8.0, 60.0)];
-        let (iv, lv, pn) = defaults[i.min(1)];
-        Self {
-            on: BoolParam::new(format!("Voice {n} On"), false),
-            interval: FloatParam::new(format!("Voice {n} Interval"), iv, lin(-24.0, 24.0)).with_unit(" st").with_step_size(1.0).with_value_to_string(Arc::new(|v| format!("{}", v.round() as i32 + 0))),
-            snap: BoolParam::new(format!("Voice {n} Scale-Aware"), true),
-            level: FloatParam::new(format!("Voice {n} Level"), lv, lin(-30.0, 6.0)).with_unit(" dB").with_step_size(0.1).with_value_to_string(Arc::new(|v| format!("{:.1}", (v * 10.0).round() / 10.0 + 0.0))),
-            pan: FloatParam::new(format!("Voice {n} Pan"), pn, lin(-100.0, 100.0)).with_unit(" %").with_step_size(1.0),
-            detune: FloatParam::new(format!("Voice {n} Detune"), 0.0, lin(-50.0, 50.0)).with_unit(" c").with_step_size(0.1),
-            formant: FloatParam::new(format!("Voice {n} Formant"), 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(0.1).with_value_to_string(Arc::new(|v| format!("{:.1}", (v * 10.0).round() / 10.0 + 0.0))),
-            delay: FloatParam::new(format!("Voice {n} Delay"), 0.0, lin(0.0, 60.0)).with_unit(" ms").with_step_size(0.1),
-        }
-    }
+fn ms_text() -> Arc<dyn Fn(f32) -> String + Send + Sync> {
+    Arc::new(|v| if v < 9.95 { format!("{:.1}", v) } else { format!("{:.0}", v) })
 }
 
 #[derive(Params)]
 pub struct NyashkTuneParams {
     #[persist = "editor-state"]
     pub editor_state: Arc<EguiState>,
-    #[persist = "preset"]
-    pub preset: AtomicU32,
-    /// pitch classes flagged BYPASS (bit i = note i of the octave); not automatable
-    #[persist = "notebypass"]
-    pub note_bypass: AtomicU32,
+    /// GUI naming: show flats (Db, Eb ...) instead of sharps; not automatable
+    #[persist = "flats"]
+    pub flats: AtomicU32,
 
     #[id = "bypass"]
     pub bypass: BoolParam,
-    #[id = "key"]
-    pub key: EnumParam<Key>,
-    #[id = "scale"]
-    pub scale: EnumParam<ScaleKind>,
-    #[nested(array, group = "Custom Notes")]
-    pub notes: [NoteParam; 12],
-    #[id = "refa"]
-    pub ref_a: FloatParam,
 
+    // correction
     #[id = "retune"]
-    pub retune: FloatParam,
+    pub speed: FloatParam,
     #[id = "transition"]
     pub transition: FloatParam,
     #[id = "link"]
     pub link: BoolParam,
+    #[id = "tolc"]
+    pub tol_cents: FloatParam,
+    #[id = "tolt"]
+    pub tol_time: FloatParam,
+    #[id = "vibkeep"]
+    pub vibrato: BoolParam,
+    #[id = "vibamt"]
+    pub vib_depth: FloatParam,
+    #[id = "corron"]
+    pub correction: BoolParam,
     #[id = "amount"]
     pub amount: FloatParam,
-    #[id = "flex"]
-    pub flex: FloatParam,
-    #[id = "humanize"]
-    pub humanize: FloatParam,
-    #[id = "natvib"]
-    pub nat_vib: FloatParam,
+    #[id = "fcorr"]
+    pub formant: BoolParam,
 
-    #[id = "transpose"]
-    pub transpose: FloatParam,
-    #[id = "fine"]
-    pub fine: FloatParam,
-    #[id = "formant"]
-    pub formant: FloatParam,
-    #[id = "keepformants"]
-    pub keep_formants: BoolParam,
-    #[id = "formanton"]
-    pub formant_on: BoolParam,
-    #[id = "voiceson"]
-    pub voices_on: BoolParam,
-    #[id = "colouron"]
-    pub colour_on: BoolParam,
-    #[id = "fmode"]
-    pub fmode: EnumParam<FormantAlgo>,
-    #[id = "ftilt"]
-    pub ftilt: FloatParam,
-    #[id = "ffollow"]
-    pub ffollow: FloatParam,
-    #[id = "tracking"]
-    pub tracking: FloatParam,
-    /// ULTRA: MIDI-like hard stepping between notes (switch + amount)
-    #[id = "ultraon"]
-    pub ultra_on: BoolParam,
-    #[id = "ultra"]
-    pub ultra: FloatParam,
-    /// GUI naming: show flats (Db, Eb ...) instead of sharps; not automatable
-    #[persist = "flats"]
-    pub flats: AtomicU32,
-    #[id = "vibshape"]
-    pub vib_shape: EnumParam<VibShape>,
-    #[id = "air"]
-    pub air: FloatParam,
-    #[id = "drive"]
-    pub drive: FloatParam,
-    #[nested(array, group = "Voices")]
-    pub voices: [VoiceParam; 2],
-
-    #[id = "viboon"]
-    pub vib_on: BoolParam,
-    #[id = "vibdepth"]
-    pub vib_depth: FloatParam,
-    #[id = "vibrate"]
-    pub vib_rate: FloatParam,
-    #[id = "vibdelay"]
-    pub vib_delay: FloatParam,
-
-    #[id = "midimode"]
-    pub midi_mode: BoolParam,
+    // global
+    #[id = "key"]
+    pub key: EnumParam<Key>,
+    #[id = "scale"]
+    pub scale: EnumParam<ScaleKind>,
+    #[nested(array, group = "Notes")]
+    pub notes: [NoteParam; 12],
+    #[id = "refa"]
+    pub ref_a: FloatParam,
     #[id = "range"]
     pub range: EnumParam<VoiceRange>,
-    #[id = "gate"]
-    pub gate: FloatParam,
-    #[id = "mix"]
-    pub mix: FloatParam,
-    #[id = "ingain"]
-    pub in_gain: FloatParam,
-    #[id = "outgain"]
-    pub out_gain: FloatParam,
+    #[id = "rlo"]
+    pub range_lo: IntParam,
+    #[id = "rhi"]
+    pub range_hi: IntParam,
+    #[id = "midimode"]
+    pub midi_mode: BoolParam,
 }
 
 fn lin(min: f32, max: f32) -> FloatRange {
     FloatRange::Linear { min, max }
 }
 
+fn midi_note_text() -> Arc<dyn Fn(i32) -> String + Send + Sync> {
+    const N: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    Arc::new(|m| format!("{}{}", N[m.rem_euclid(12) as usize], m.div_euclid(12) - 1))
+}
+
+fn midi_note_parse() -> Arc<dyn Fn(&str) -> Option<i32> + Send + Sync> {
+    Arc::new(|s| {
+        let s = s.trim();
+        if let Ok(n) = s.parse::<i32>() {
+            return Some(n);
+        }
+        let up = s.to_uppercase().replace('♯', "#").replace('♭', "B");
+        let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+        let flats = ["C", "DB", "D", "EB", "E", "F", "GB", "G", "AB", "A", "BB", "B"];
+        for len in [2usize, 1] {
+            if up.len() > len {
+                let (n, o) = up.split_at(len);
+                let pc = names.iter().position(|x| *x == n).or_else(|| flats.iter().position(|x| *x == n));
+                if let (Some(pc), Ok(oct)) = (pc, o.parse::<i32>()) {
+                    return Some(pc as i32 + 12 * (oct + 1));
+                }
+            }
+        }
+        None
+    })
+}
+
 impl Default for NoteParam {
     fn default() -> Self {
-        Self { on: BoolParam::new("On", true) }
+        Self { state: EnumParam::new("State", NoteState::Scale) }
     }
 }
 
 impl Default for NyashkTuneParams {
     fn default() -> Self {
         const NOTE_NAMES: [&str; 12] = ["C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb", "G", "G#/Ab", "A", "A#/Bb", "B"];
-        let notes: [NoteParam; 12] = std::array::from_fn(|i| NoteParam {
-            on: BoolParam::new(format!("Custom Note {}", NOTE_NAMES[i]), true),
-        });
+        let notes: [NoteParam; 12] = std::array::from_fn(|i| NoteParam { state: EnumParam::new(format!("Note {}", NOTE_NAMES[i]), NoteState::Scale) });
+        let (lo, hi) = VoiceRange::Generic.notes();
+        let off_or = |unit: &'static str| -> Arc<dyn Fn(f32) -> String + Send + Sync> {
+            Arc::new(move |v| if v < 0.5 { "Off".to_string() } else { format!("{:.0}{unit}", v) })
+        };
+        let off_parse = || -> Arc<dyn Fn(&str) -> Option<f32> + Send + Sync> {
+            Arc::new(|s| {
+                let t = s.trim().to_lowercase();
+                if t == "off" {
+                    return Some(0.0);
+                }
+                t.trim_end_matches("ms").trim_end_matches('c').trim().parse::<f32>().ok()
+            })
+        };
         Self {
-            editor_state: EguiState::from_size(900, 670),
-            preset: AtomicU32::new(0),
-            note_bypass: AtomicU32::new(0),
+            editor_state: EguiState::from_size(940, 600),
+            flats: AtomicU32::new(0),
 
             bypass: BoolParam::new("Bypass", false).make_bypass(),
-            key: EnumParam::new("Key", Key::C),
-            scale: EnumParam::new("Scale", ScaleKind::Major),
+
+            speed: FloatParam::new("Speed", 15.0, ms_range()).with_unit(" ms").with_step_size(0.1).with_value_to_string(ms_text()),
+            transition: FloatParam::new("Note Transition", 120.0, ms_range()).with_unit(" ms").with_step_size(0.1).with_value_to_string(ms_text()),
+            link: BoolParam::new("Link", false),
+            tol_cents: FloatParam::new("Tolerance Cents", 0.0, lin(0.0, 40.0))
+                .with_step_size(1.0)
+                .with_value_to_string(off_or(" c"))
+                .with_string_to_value(off_parse()),
+            tol_time: FloatParam::new("Tolerance Time", 0.0, lin(0.0, 300.0))
+                .with_step_size(1.0)
+                .with_value_to_string(off_or(" ms"))
+                .with_string_to_value(off_parse()),
+            vibrato: BoolParam::new("Vibrato", true),
+            vib_depth: FloatParam::new("Vibrato Depth", 100.0, lin(0.0, 200.0)).with_unit(" %").with_step_size(1.0),
+            correction: BoolParam::new("Correction", true),
+            amount: FloatParam::new("Correction Amount", 100.0, lin(1.0, 100.0)).with_unit(" %").with_step_size(1.0),
+            formant: BoolParam::new("Formant Correction", true),
+
+            key: EnumParam::new("Root", Key::C),
+            scale: EnumParam::new("Scale", ScaleKind::Chromatic),
             notes,
-            ref_a: FloatParam::new("Reference A4", 440.0, lin(415.0, 466.0))
-                .with_unit(" Hz")
-                .with_step_size(0.1),
-
-            retune: FloatParam::new(
-                "Retune Speed",
-                50.0,
-                FloatRange::Skewed { min: 0.0, max: 400.0, factor: FloatRange::skew_factor(-1.6) },
-            )
-            .with_unit(" ms")
-            .with_step_size(0.1),
-            transition: FloatParam::new(
-                "Note Transition",
-                50.0,
-                FloatRange::Skewed { min: 0.0, max: 400.0, factor: FloatRange::skew_factor(-1.6) },
-            )
-            .with_unit(" ms")
-            .with_step_size(0.1),
-            link: BoolParam::new("Link Speed/Transition", false),
-            amount: FloatParam::new("Amount", 100.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(0.1),
-            flex: FloatParam::new("Flex-Tune", 0.0, lin(0.0, 100.0)).with_unit(" c").with_step_size(0.1),
-            humanize: FloatParam::new("Humanize", 0.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(0.1),
-            nat_vib: FloatParam::new("Natural Vibrato", 0.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(0.1),
-
-            transpose: FloatParam::new("Transpose", 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(1.0).with_value_to_string(Arc::new(|v| format!("{}", v.round() as i32 + 0))),
-            fine: FloatParam::new("Detune", 0.0, lin(-100.0, 100.0)).with_unit(" c").with_step_size(0.1),
-            formant: FloatParam::new("Formant Shift", 0.0, lin(-12.0, 12.0)).with_unit(" st").with_step_size(0.1).with_value_to_string(Arc::new(|v| format!("{:.1}", (v * 10.0).round() / 10.0 + 0.0))),
-            keep_formants: BoolParam::new("Keep Formants", true),
-            formant_on: BoolParam::new("Formant On", true),
-            voices_on: BoolParam::new("Voices On", true),
-            colour_on: BoolParam::new("Colour On", true),
-            fmode: EnumParam::new("Formant Algorithm", FormantAlgo::Classic),
-            ftilt: FloatParam::new("Formant Tilt", 0.0, lin(-100.0, 100.0)).with_unit(" %").with_step_size(1.0),
-            ffollow: FloatParam::new("Formant Follow", 100.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
-            tracking: FloatParam::new("Tracking", 22.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
-            ultra_on: BoolParam::new("Ultra", false),
-            ultra: FloatParam::new("Ultra Amount", 100.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
-            flats: AtomicU32::new(0),
-            vib_shape: EnumParam::new("Vibrato Shape", VibShape::Sine),
-            air: FloatParam::new("Air", 0.0, lin(-6.0, 12.0)).with_unit(" dB").with_step_size(0.1).with_value_to_string(Arc::new(|v| format!("{:.1}", (v * 10.0).round() / 10.0 + 0.0))),
-            drive: FloatParam::new("Drive", 0.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(1.0),
-            voices: std::array::from_fn(VoiceParam::new),
-
-            vib_on: BoolParam::new("Vibrato On", false),
-            vib_depth: FloatParam::new("Vibrato Depth", 30.0, lin(0.0, 100.0)).with_unit(" c").with_step_size(0.1),
-            vib_rate: FloatParam::new("Vibrato Rate", 5.5, lin(2.0, 9.0)).with_unit(" Hz").with_step_size(0.01),
-            vib_delay: FloatParam::new("Vibrato Delay", 250.0, lin(0.0, 1000.0)).with_unit(" ms").with_step_size(1.0),
-
-            midi_mode: BoolParam::new("MIDI Target", false),
+            ref_a: FloatParam::new("Reference Frequency", 440.0, lin(415.3, 466.16)).with_unit(" Hz").with_step_size(0.01),
             range: EnumParam::new("Voice Range", VoiceRange::Generic),
-            gate: FloatParam::new("Input Gate", -60.0, lin(-90.0, -20.0)).with_unit(" dB").with_step_size(0.1),
-            mix: FloatParam::new("Mix", 100.0, lin(0.0, 100.0)).with_unit(" %").with_step_size(0.1),
-            in_gain: FloatParam::new("Input Gain", 0.0, lin(-24.0, 24.0)).with_unit(" dB").with_step_size(0.1),
-            out_gain: FloatParam::new("Output Gain", 0.0, lin(-24.0, 24.0)).with_unit(" dB").with_step_size(0.1),
+            range_lo: IntParam::new("Range Low", lo, IntRange::Linear { min: 24, max: 96 }).with_value_to_string(midi_note_text()).with_string_to_value(midi_note_parse()),
+            range_hi: IntParam::new("Range High", hi, IntRange::Linear { min: 24, max: 96 }).with_value_to_string(midi_note_text()).with_string_to_value(midi_note_parse()),
+            midi_mode: BoolParam::new("MIDI Target", false),
         }
     }
 }
 
 impl NyashkTuneParams {
-    pub fn custom_mask(&self) -> u16 {
-        let mut m = 0u16;
-        for (i, n) in self.notes.iter().enumerate() {
-            if n.on.value() {
-                m |= 1 << i;
+    /// legal pitch classes of Root + Scale ("Custom" = user scale: starts with all notes illegal)
+    pub fn scale_mask(&self) -> u16 {
+        engine::allowed_mask(self.scale.value() as usize, self.key.value() as usize, 0)
+    }
+
+    /// Effective state of pitch class `pc` (Scale resolved).
+    pub fn note_state(&self, pc: usize) -> NoteState {
+        match self.notes[pc].state.value() {
+            NoteState::Scale => {
+                if (self.scale_mask() >> pc) & 1 == 1 {
+                    NoteState::Legal
+                } else {
+                    NoteState::Illegal
+                }
             }
-        }
-        m
-    }
-
-    /// (lowest, highest) fundamental searched for, per voice type.
-    pub fn range_limits(&self) -> (f32, f32) {
-        match self.range.value() {
-            VoiceRange::Generic => (70.0, 1000.0),
-            VoiceRange::Bass => (60.0, 340.0),      // ~B1 .. F4
-            VoiceRange::Baritone => (75.0, 420.0),  // ~D2 .. G#4
-            VoiceRange::Tenor => (95.0, 560.0),     // ~G2 .. C#5
-            VoiceRange::Alto => (120.0, 760.0),     // ~B2 .. F#5
-            VoiceRange::Mezzo => (140.0, 920.0),    // ~C#3 .. A#5
-            VoiceRange::Soprano => (180.0, 1200.0), // ~F#3 .. D6
-            VoiceRange::Instrument => (60.0, 2000.0),
+            s => s,
         }
     }
 
-    pub fn range_hz(&self) -> f32 {
-        self.range_limits().0
+    /// true when a key was changed by hand (the scale name then shows an asterisk)
+    pub fn scale_modified(&self) -> bool {
+        self.notes.iter().any(|n| n.state.value() != NoteState::Scale)
     }
 
-    pub fn allowed_mask(&self) -> u16 {
-        engine::allowed_mask(self.scale.value() as usize, self.key.value() as usize, self.custom_mask())
+    /// lowest fundamental searched for: a little under the range
+    pub fn lowest_hz(&self) -> f32 {
+        let lo = self.range_lo.value().min(self.range_hi.value()) as f32 - 3.0;
+        (440.0 * 2f32.powf((lo - 69.0) / 12.0)).clamp(50.0, 400.0)
     }
 
     pub fn engine_params(&self) -> engine::Params {
+        let mut note_override = [0u8; 12];
+        for (pc, n) in self.notes.iter().enumerate() {
+            note_override[pc] = match n.state.value() {
+                NoteState::Scale => 0,
+                NoteState::Legal => 1,
+                NoteState::Illegal => 2,
+                NoteState::Up => 3,
+                NoteState::Down => 4,
+                NoteState::Bypass => 5,
+            };
+        }
+        let (lo, hi) = (self.range_lo.value().min(self.range_hi.value()), self.range_lo.value().max(self.range_hi.value()));
         engine::Params {
             bypass: self.bypass.value(),
             key: self.key.value() as usize,
             scale: self.scale.value() as usize,
-            custom_mask: self.custom_mask(),
+            custom_mask: 0,
             ref_a: self.ref_a.value(),
-            retune_ms: self.retune.value(),
-            transition_ms: self.transition.value(),
-            amount: self.amount.value() / 100.0,
-            flex_cents: self.flex.value(),
-            humanize: self.humanize.value() / 100.0,
-            natural_vib: self.nat_vib.value() / 100.0,
-            transpose: self.transpose.value(),
-            fine_cents: self.fine.value(),
-            formant_semis: self.formant.value(),
-            formant_preserve: self.keep_formants.value(),
-            formant_on: self.formant_on.value(),
-            voices_on: self.voices_on.value(),
-            colour_on: self.colour_on.value(),
-            formant_mode: formant::FormantMode::from_index(self.fmode.value() as usize),
-            formant_tilt: self.ftilt.value() / 100.0,
-            formant_follow: self.ffollow.value() / 100.0,
-            tracking: self.tracking.value() / 100.0,
-            ultra: if self.ultra_on.value() { self.ultra.value() / 100.0 } else { 0.0 },
-            bypass_mask: (self.note_bypass.load(Ordering::Relaxed) & 0xFFF) as u16,
-            vib_shape: self.vib_shape.value() as usize,
-            air_db: self.air.value(),
-            drive: self.drive.value() / 100.0,
-            voices: std::array::from_fn(|i| {
-                let v = &self.voices[i];
-                engine::VoiceParams {
-                    on: v.on.value(),
-                    interval: v.interval.value(),
-                    snap: v.snap.value(),
-                    level_db: v.level.value(),
-                    pan: v.pan.value() / 100.0,
-                    detune_cents: v.detune.value(),
-                    formant_semis: v.formant.value(),
-                    delay_ms: v.delay.value(),
-                }
-            }),
-            vib_on: self.vib_on.value(),
-            vib_depth_cents: self.vib_depth.value(),
-            vib_rate_hz: self.vib_rate.value(),
-            vib_delay_ms: self.vib_delay.value(),
+            retune_ms: self.speed.value(),
+            transition_ms: if self.link.value() { self.speed.value() } else { self.transition.value() },
+            amount: if self.correction.value() { self.amount.value() / 100.0 } else { 0.0 },
+            note_override,
+            tol_cents: self.tol_cents.value(),
+            tol_ms: self.tol_time.value(),
+            keep_vibrato: self.vibrato.value(),
+            vib_amount: self.vib_depth.value() / 100.0,
+            range_lo: lo as f32 - 0.5,
+            range_hi: hi as f32 + 0.5,
+            formant_preserve: self.formant.value(),
+            formant_follow: 1.0,
             midi_mode: self.midi_mode.value(),
-            min_hz: self.range_hz(),
-            // the range sets the lowest note (and the latency); upwards we always search to at least
-            // ~C6, so singing above the chosen range still tracks instead of falling an octave down
-            max_hz: self.range_limits().1.max(1100.0),
-            gate_db: self.gate.value(),
-            mix: self.mix.value() / 100.0,
-            in_gain_db: self.in_gain.value(),
-            out_gain_db: self.out_gain.value(),
+            min_hz: self.lowest_hz(),
+            // search at least up to ~C6: singing above the range is detected (and passed as it is)
+            // instead of being taken an octave down
+            max_hz: (440.0 * 2f32.powf((hi as f32 + 5.0 - 69.0) / 12.0)).max(1100.0),
+            voices_on: false,
+            colour_on: false,
+            vib_on: false,
+            ..engine::Params::default()
         }
     }
 }
@@ -465,6 +379,9 @@ pub struct Meters {
     pub hz: AtomicF32,
     pub target: AtomicF32,
     pub corr: AtomicF32,
+    /// block peaks (linear), the GUI lets them fall
+    pub in_pk: AtomicF32,
+    pub out_pk: AtomicF32,
 }
 
 impl Default for Meters {
@@ -474,6 +391,8 @@ impl Default for Meters {
             hz: AtomicF32::new(0.0),
             target: AtomicF32::new(0.0),
             corr: AtomicF32::new(0.0),
+            in_pk: AtomicF32::new(0.0),
+            out_pk: AtomicF32::new(0.0),
         }
     }
 }
@@ -549,7 +468,7 @@ impl Plugin for NyashkTune {
         config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.cur_min_hz = self.params.range_hz();
+        self.cur_min_hz = self.params.lowest_hz();
         let eng = engine::Engine::new(config.sample_rate as f64, self.cur_min_hz);
         context.set_latency_samples(eng.latency_samples());
         self.engine = Some(eng);
@@ -581,6 +500,7 @@ impl Plugin for NyashkTune {
         }
         eng.set_params(&ep);
 
+        let (mut ipk, mut opk) = (0.0f32, 0.0f32);
         let mut next_event = context.next_event();
         for (sample_id, mut channels) in buffer.iter_samples().enumerate() {
             while let Some(event) = next_event {
@@ -599,10 +519,12 @@ impl Plugin for NyashkTune {
             let mut inp = [0.0f32; engine::MAX_CH];
             for (i, s) in channels.iter_mut().enumerate().take(nch) {
                 inp[i] = *s;
+                ipk = ipk.max(s.abs());
             }
             let out = eng.process_frame(inp, nch);
             for (i, s) in channels.iter_mut().enumerate().take(nch) {
                 *s = out[i];
+                opk = opk.max(s.abs());
             }
         }
 
@@ -612,6 +534,8 @@ impl Plugin for NyashkTune {
         self.meters.hz.store(m.hz, Ordering::Relaxed);
         self.meters.target.store(m.target, Ordering::Relaxed);
         self.meters.corr.store(m.corr, Ordering::Relaxed);
+        self.meters.in_pk.store(self.meters.in_pk.load(Ordering::Relaxed).max(ipk), Ordering::Relaxed);
+        self.meters.out_pk.store(self.meters.out_pk.load(Ordering::Relaxed).max(opk), Ordering::Relaxed);
 
         ProcessStatus::Normal
     }
@@ -630,16 +554,31 @@ mod tests {
     #[test]
     fn typed_values_parse() {
         let p = NyashkTuneParams::default();
-        let n = p.retune.string_to_normalized_value("100").unwrap();
-        assert!((p.retune.preview_plain(n) - 100.0).abs() < 0.5);
-        let n = p.retune.string_to_normalized_value("100 ms").unwrap();
-        assert!((p.retune.preview_plain(n) - 100.0).abs() < 0.5);
-        let n = p.gate.string_to_normalized_value("-40").unwrap();
-        assert!((p.gate.preview_plain(n) + 40.0).abs() < 0.5);
-        let n = p.transpose.string_to_normalized_value("-5").unwrap();
-        assert!((p.transpose.preview_plain(n) + 5.0).abs() < 0.1);
+        let n = p.speed.string_to_normalized_value("100").unwrap();
+        assert!((p.speed.preview_plain(n) - 100.0).abs() < 0.5);
+        let n = p.speed.string_to_normalized_value("100 ms").unwrap();
+        assert!((p.speed.preview_plain(n) - 100.0).abs() < 0.5);
+        let n = p.tol_time.string_to_normalized_value("Off").unwrap();
+        assert_eq!(p.tol_time.preview_plain(n), 0.0);
+        let n = p.tol_cents.string_to_normalized_value("20 c").unwrap();
+        assert!((p.tol_cents.preview_plain(n) - 20.0).abs() < 0.5);
         let n = p.ref_a.string_to_normalized_value("432").unwrap();
-        assert!((p.ref_a.preview_plain(n) - 432.0).abs() < 0.5);
+        assert!((p.ref_a.preview_plain(n) - 432.0).abs() < 0.05);
+        let n = p.range_lo.string_to_normalized_value("C2").unwrap();
+        assert_eq!(p.range_lo.preview_plain(n), 36);
+        let n = p.range_hi.string_to_normalized_value("F#4").unwrap();
+        assert_eq!(p.range_hi.preview_plain(n), 66);
+    }
+
+    #[test]
+    fn defaults_are_waves_like() {
+        let p = NyashkTuneParams::default();
+        assert!((p.speed.value() - 15.0).abs() < 0.01);
+        assert!((p.transition.value() - 120.0).abs() < 0.01);
+        assert!(p.vibrato.value() && (p.vib_depth.value() - 100.0).abs() < 0.01);
+        let e = p.engine_params();
+        assert!(!e.voices_on && !e.colour_on && !e.vib_on);
+        assert_eq!(e.amount, 1.0);
     }
 }
 
@@ -668,7 +607,7 @@ fn demo_voice(buffer: &mut Buffer) {
         let y = src * 0.1 + 2.0 * r * th.cos() * st.3 - r * r * st.4;
         st.4 = st.3;
         st.3 = y;
-        let v = if gap { 0.0 } else { (y * 1.2) as f32 };
+        let v = if gap { 0.0 } else { (y * 0.15) as f32 };
         for s in frame.iter_mut() {
             *s = v;
         }
