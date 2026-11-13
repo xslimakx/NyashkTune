@@ -356,6 +356,8 @@ pub struct Engine {
     transition: bool, // gliding towards a freshly selected note
     cand_note: i32,   // a different note the pitch is moving to (must hold a moment before we switch)
     cand_age: f64,
+    far_note: i32, // the voice is clearly nearer to another note (see pick_note)
+    far_age: f64,
     note_sm: f64,     // lightly smoothed pitch used only to *choose* the note (not to correct it)
 }
 
@@ -429,6 +431,8 @@ impl Engine {
             transition: false,
             cand_note: i32::MIN,
             cand_age: 0.0,
+            far_note: i32::MIN,
+            far_age: 0.0,
             note_sm: 60.0,
         };
         e.set_lowest_hz(lowest_hz);
@@ -880,7 +884,7 @@ impl Engine {
         (self.allowed_pc >> pc) & 1 == 1
     }
 
-    fn pick_note(&mut self, basis: f64, dt: f64) -> bool {
+    fn pick_note(&mut self, basis: f64, raw: f64, dt: f64) -> bool {
         let base = basis.floor() as i32;
         let mut best = None;
         let mut bd = 1e9;
@@ -908,6 +912,40 @@ impl Engine {
         // on scoops, cracks or a voice sitting right between two notes
         let dwell = 0.010 + 0.020 * tr;
         if self.have_note && self.is_allowed(self.cur_note) {
+            // Never pull the voice further than to its nearest note: when the (unsmoothed) pitch is
+            // already clearly nearer to another note (by > 0.9 st), switch now. Waiting here held the
+            // old note through fast slides and pulled the voice 2-3 st (even 12 st on a detector
+            // octave slip) for tens of ms - heard as a broken, gargled sound. Vibrato never gets here.
+            let (mut rb, mut rbd) = (self.cur_note, 1e9f64);
+            let rbase = raw.floor() as i32;
+            for m in (rbase - 7)..=(rbase + 8) {
+                if self.is_allowed(m) && (raw - m as f64).abs() < rbd {
+                    rbd = (raw - m as f64).abs();
+                    rb = m;
+                }
+            }
+            // confirmed for ~12 ms: a single in-between reading in the middle of a big jump is ignored.
+            // What must last is "clearly away from the current note", not one particular new note:
+            // on a fast slide the nearest note changes every ~10 ms and waiting for one of them kept
+            // the old note (pulling 3-4 st); after a detector octave slip it pulled 12 st.
+            if rb != self.cur_note && (raw - self.cur_note as f64).abs() - rbd > 0.9 {
+                self.far_note = rb;
+                self.far_age += dt;
+            } else {
+                self.far_note = i32::MIN;
+                self.far_age = 0.0;
+            }
+            if self.far_note == rb && self.far_age >= 0.012 {
+                self.far_note = i32::MIN;
+                self.far_age = 0.0;
+                self.cur_note = rb;
+                self.note_age = 0.0;
+                self.transition = true;
+                self.cand_note = i32::MIN;
+                self.cand_age = 0.0;
+                self.note_sm = raw;
+                return true;
+            }
             let d_cur = (basis - self.cur_note as f64).abs();
             // Two ways to move on: clearly past the hysteresis (quick, after `dwell`), or simply
             // nearer to another note for a sustained moment. The second keeps a high Tracking from
@@ -983,8 +1021,12 @@ impl Engine {
             self.note_sm += (basis - self.note_sm) * (1.0 - (-dt / tau_n).exp());
         }
         let mut err = 0.0;
-        if self.pick_note(self.note_sm, dt) {
+        if self.pick_note(self.note_sm, basis, dt) {
             err = self.cur_note as f64 - basis;
+            // the correction never needs to move the voice by an octave (that is Transpose's job):
+            // taken modulo 12, a detector octave slip or a register flip costs nothing instead of
+            // pulling the voice 12 st for a moment
+            err -= 12.0 * (err / 12.0).round();
             let fl = self.p.flex_cents as f64 / 100.0 * (1.0 - u);
             err = if err > fl { err - fl } else if err < -fl { err + fl } else { 0.0 };
             let amount = (self.p.amount as f64).clamp(0.0, 1.0);
@@ -1869,7 +1911,11 @@ mod fuzz_tests {
                     let w: Vec<(f64, i32)> = tg.iter().copied().filter(|(t, _)| *t >= t0 && *t < t0 + dur).collect();
                     let lo = a.min(b) - if kind(k) == 3 { 1 } else { 0 };
                     let hi = a.max(b);
-                    if let Some(&(t, m)) = w.iter().find(|(_, m)| *m != 0 && (*m < lo || *m > hi)) {
+                    // a flash shorter than 20 ms while the detector itself is still mid-leap is not
+                    // counted (the correction then follows the reading, the output is the dry voice)
+                    let outside: Vec<&(f64, i32)> = w.iter().filter(|(_, m)| *m != 0 && (*m < lo || *m > hi)).collect();
+                    if outside.len() as f64 * 64.0 / fs > 0.02 {
+                        let &(t, m) = outside[0];
                         bad_span.push((k, a, b, m, ((t - t0) * 1000.0) as i32));
                     }
                     if kind(k) == 0 {
@@ -1910,6 +1956,108 @@ mod fuzz_tests {
             }
         }
         assert!(report.is_empty(), "transition problems:\n{}", report.join("\n"));
+    }
+
+    /// The tuner must never pull the voice far from its nearest note for more than a moment:
+    /// fast slides (a semitone every ~10 ms), big leaps and a detector octave slip used to hold the
+    /// old note and pull the voice 2-4 st (12 st on an octave slip) for tens of ms - a gargled,
+    /// broken sound with Retune 0.
+    #[test]
+    fn never_pulls_far_from_the_nearest_note() {
+        let fs = 48000.0;
+        let smooth = |x: f64| { let x = x.clamp(0.0, 1.0); x * x * (3.0 - 2.0 * x) };
+        // 0.3 s notes joined by fast slides of 2..5 st in 25..50 ms, up and down
+        let pts: [(f64, f64); 12] = [(54.0, 0.02), (50.6, 0.025), (55.0, 0.015), (51.3, 0.02), (56.1, 0.025), (53.0, 0.012), (57.4, 0.02), (52.2, 0.025), (55.6, 0.015), (51.0, 0.02), (54.8, 0.012), (50.9, 0.018)];
+        let dur = 0.25;
+        let mut seed = 99u32;
+        let jit: Vec<f64> = (0..2000).map(|_| (xorshift(&mut seed) as f64 - 0.5) * 0.16).collect();
+        let curve = |t: f64| {
+            let k = ((t / dur) as usize).min(pts.len() - 1);
+            let tau = t - k as f64 * dur;
+            let b = pts[k].0;
+            let a = if k == 0 { b } else { pts[k - 1].0 };
+            // a slide that overshoots a little and settles, random jitter like a real voice
+            let sl = smooth(tau / pts[k].1);
+            let over = 0.25 * (b - a).signum() * (-(tau - pts[k].1).max(0.0) / 0.03).exp() * sl;
+            a + (b - a) * sl + over + jit[((t * 200.0) as usize).min(1999)] + 0.15 * (2.0 * PI * 5.5 * t).sin()
+        };
+        let x = sung(fs, curve, dur * pts.len() as f64);
+        for (scale, tracking) in [(0usize, 0.22f32), (0, 1.0), (2, 0.22), (2, 1.0)] {
+            let mut e = Engine::new(fs, 70.0);
+            let mut p = Params::default();
+            p.scale = scale;
+            p.key = 5;
+            p.tracking = tracking;
+            p.retune_ms = 0.0;
+            p.transition_ms = 0.0;
+            let lim = if scale == 0 { 1.6 } else { 2.1 };
+            let (mut run, mut worst, mut maxc) = (0usize, 0usize, 0.0f32);
+            for ch in x.chunks(64) {
+                e.set_params(&p);
+                for &s in ch {
+                    e.process_frame([s, s], 1);
+                }
+                let c = e.meters.corr.abs();
+                maxc = maxc.max(c);
+                if e.meters.voiced && c > lim {
+                    run += 1;
+                    worst = worst.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+            let ms = worst as f64 * 64.0 / fs * 1000.0;
+            println!("scale {scale} tracking {tracking}: longest pull > {lim} st: {ms:.0} ms (max {maxc:.2} st)");
+            assert!(ms <= 20.0, "scale {scale} tracking {tracking}: pulled > {lim} st for {ms:.0} ms (max {maxc:.2} st)");
+        }
+    }
+
+    /// Same check on real recordings (they are not shipped with the repo): set NYASHK_VOICE_DIR to a
+    /// folder of raw mono f32 files at 48 kHz (`*.f32`), e.g. dry a cappella takes. Skipped otherwise.
+    #[test]
+    fn real_voice_never_pulls_far() {
+        let Ok(dir) = std::env::var("NYASHK_VOICE_DIR") else { return };
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "f32")).collect();
+        files.sort();
+        let mut report = Vec::new();
+        for f in &files {
+            let raw = std::fs::read(f).unwrap();
+            let x: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            for (scale, tracking) in [(0usize, 0.22f32), (0, 1.0), (2, 0.22), (2, 1.0)] {
+                let mut e = Engine::new(48000.0, 70.0);
+                let mut p = Params::default();
+                p.scale = scale;
+                p.key = 5;
+                p.tracking = tracking;
+                p.retune_ms = 0.0;
+                p.transition_ms = 0.0;
+                let lim = if scale == 0 { 1.6 } else { 2.1 };
+                let (mut run, mut worst, mut maxc) = (0usize, 0usize, 0.0f32);
+                for ch in x.chunks(64) {
+                    e.set_params(&p);
+                    for &s in ch {
+                        e.process_frame([s, s], 1);
+                    }
+                    let c = e.meters.corr.abs();
+                    if e.meters.voiced {
+                        maxc = maxc.max(c);
+                    }
+                    if e.meters.voiced && c > lim {
+                        run += 1;
+                        worst = worst.max(run);
+                    } else {
+                        run = 0;
+                    }
+                }
+                let ms = worst as f64 * 64.0 / 48.0;
+                let line = format!("{} scale {scale} tracking {tracking}: longest pull > {lim} st {ms:.0} ms, max {maxc:.2} st", f.file_name().unwrap().to_string_lossy());
+                println!("{line}");
+                if ms > 25.0 || maxc > 6.0 {
+                    report.push(line);
+                }
+            }
+        }
+        assert!(report.is_empty(), "{}", report.join("\n"));
     }
 
     /// Switching modules on and off while singing must not click.

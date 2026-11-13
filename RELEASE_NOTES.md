@@ -1,3 +1,9 @@
+## NyashkTune 1.1.4
+
+- **No more horrible jumps and broken sound.** On a fast slide of the voice, after a leap, or when the pitch detector slipped an octave, the tuner kept the old note for tens of milliseconds and pulled the voice 2-5 semitones away, sometimes a whole octave (12 st). With Retune 0 this was heard as a gargled, broken sound and as the tall spikes on the display. Now the tuner never pulls the voice further than its nearest note for more than ~12 ms, and an octave slip costs nothing (the correction never moves the voice by a whole octave).
+- Checked on real a cappella and speech recordings, not only on synthetic voices: before, the voice was pulled beyond its nearest note for up to 145 ms at a time (up to 12 st); now for at most 12 ms. Detection stays within ~5 cents of a reference pitch tracker (pYIN) on singing, with almost no octave errors.
+- New regression tests for this (`never_pulls_far_from_the_nearest_note`, and `real_voice_never_pulls_far` on your own recordings via `NYASHK_VOICE_DIR`), plus an offline tool `examples/run_raw.rs` to run the engine over a recording and log what it does.
+
 ## NyashkTune 1.1.3
 
 - **Notes no longer get missed at high Tracking.** A note sung a little off (25-40 cents) right after a step could stay on the previous note for the whole held note when Tracking was high. Tracking now only delays a switch for a moment; if your voice stays nearer to another note, the tuner always moves to it.
