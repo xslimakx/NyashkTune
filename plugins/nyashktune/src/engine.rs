@@ -369,6 +369,10 @@ pub struct Engine {
     far_note: i32, // the voice is clearly nearer to another note (see pick_note)
     far_age: f64,
     note_sm: f64,
+    c_prev: f64,  // centre at the previous grain (for its slope)
+    c_slope: f64, // how fast the note centre moves, semitones / s (smoothed)
+    n_prev: f64,
+    n_slope: f64, // the same for the lightly smoothed pitch
     centre: f64,      // note centre: vibrato taken out (midpoint of its last peak and trough)
     vib_sm: f64,      // lightly smoothed pitch the vibrato turning points are found on
     ext: f64,         // running extreme since the last turning point
@@ -453,6 +457,10 @@ impl Engine {
             far_note: i32::MIN,
             far_age: 0.0,
             note_sm: 60.0,
+            c_prev: 60.0,
+            c_slope: 0.0,
+            n_prev: 60.0,
+            n_slope: 0.0,
             centre: 60.0,
             vib_sm: 60.0,
             ext: 60.0,
@@ -1006,8 +1014,15 @@ impl Engine {
         let tol = (self.p.tol_cents as f64 / 100.0).clamp(0.0, 0.4);
         if let Some((rb, rbd)) = self.target_for(raw) {
             if rb != cur && (raw - cur as f64).abs() - rbd > 0.9 + tol {
+                // counted only once the pitch has stopped sliding fast (> 25 st/s: a slide passes
+                // other notes; a vibrato never moves that fast)
+                if self.far_note != rb {
+                    self.far_age = 0.0;
+                }
                 self.far_note = rb;
-                self.far_age += dt;
+                if self.n_slope.abs() < 25.0 {
+                    self.far_age += dt;
+                }
             } else {
                 self.far_note = i32::MIN;
                 self.far_age = 0.0;
@@ -1026,14 +1041,21 @@ impl Engine {
         // past the Tolerance border, but not past the small guard: allowed after a longer while, so
         // the guard only stops quick flicker and never keeps a note the voice has clearly left
         let past_border = d_cur > 0.5 + tol;
-        if best != cur && past_border {
+        // While the voice glides from note to note (the centre moves faster than 8 st/s) no note is
+        // chosen on the way: a slide 60 -> 58 used to settle on 59 first and pull the voice up to it
+        // for a while. The far rule above still catches real jumps.
+        let gliding = self.c_slope.abs() > 8.0;
+        if best != cur && past_border && gliding {
+            self.cand_note = best;
+            self.cand_age = 0.0;
+        } else if best != cur && past_border {
             if self.cand_note == best {
                 self.cand_age += dt;
             } else {
                 self.cand_note = best;
                 self.cand_age = 0.0;
             }
-            if (past && self.cand_age >= hold) || self.cand_age >= hold + 0.12 {
+            if (past && self.cand_age >= hold) || self.cand_age >= hold + hold.max(0.035) {
                 switch(self, best);
             }
         } else {
@@ -1106,6 +1128,10 @@ impl Engine {
             self.slow_midi = midi;
             self.note_sm = midi;
             self.centre = midi;
+            self.c_prev = midi;
+            self.c_slope = 0.0;
+            self.n_prev = midi;
+            self.n_slope = 0.0;
             self.vib_sm = midi;
             self.ext = midi;
             self.tp_max = (f64::NAN, -1.0);
@@ -1128,6 +1154,17 @@ impl Engine {
         if (self.note_sm - self.centre).abs() > 1.2 {
             self.centre = self.note_sm; // left the vibrato: follow at once
         }
+        // how fast the note centre (vibrato taken out) is moving: a glide / scoop between notes
+        if dt > 0.0 {
+            let sl = (self.centre - self.c_prev) / dt;
+            self.c_slope += (sl - self.c_slope) * (1.0 - (-dt / 0.012).exp());
+        }
+        self.c_prev = self.centre;
+        if dt > 0.0 {
+            let sl = ((self.note_sm - self.n_prev) / dt).clamp(-200.0, 200.0);
+            self.n_slope += (sl - self.n_slope) * (1.0 - (-dt / 0.008).exp());
+        }
+        self.n_prev = self.note_sm;
         let keep = self.p.keep_vibrato;
         // the note is always chosen on the centre: vibrato never flips it to a neighbour, in either
         // mode (Vibrato On / Off only decides whether the vibrato itself is corrected away)
@@ -1155,7 +1192,13 @@ impl Engine {
         // glide time: Note Transition while moving onto a newly selected note,
         // Speed for settling inside a note
         let tau = if self.transition { self.p.transition_ms } else { self.p.retune_ms } as f64 / 1000.0;
-        if tau < 0.0005 {
+        // While the voice has crossed into another note's half and the switch is only waiting out
+        // the guard / Tolerance time, do not pull it any harder back to the note it is leaving
+        // (that was the "note hangs and drags" feeling: up to half a semitone of pull for 200 ms).
+        let pending = (self.cand_note != i32::MIN && self.cand_note != self.cur_note) || self.far_note != i32::MIN;
+        if pending && err.abs() > self.corr_sm.abs() {
+            // hold
+        } else if tau < 0.0005 {
             self.corr_sm = err;
         } else {
             self.corr_sm += (err - self.corr_sm) * (1.0 - (-dt / tau).exp());
@@ -1725,7 +1768,8 @@ mod fuzz_tests {
         p.transition_ms = 0.0;
         let (h, lat) = run_engine(fs, &x, &p);
         let (hmax, havg) = dev(&h, lat, 0.4, 1.4, 57.0, 0.0);
-        let (hmax2, havg2) = dev(&h, lat, 1.6, 2.9, 60.0, 0.0);
+        // (the switch waits until the jump has stopped sliding: settled 150 ms after it)
+        let (hmax2, havg2) = dev(&h, lat, 1.65, 2.9, 60.0, 0.0);
         // the jump lands on a vibrato peak (~+0.8 st): give the centre a moment
         let m = pitch_at(&h, ((1.5 + 0.2) * fs) as usize + lat, fs);
         println!("Vibrato Off, Speed 0: flat within max {hmax:.1} c avg {havg:.1} c, after the step {hmax2:.1} / {havg2:.1} c, 200 ms after the jump {m:.2}");

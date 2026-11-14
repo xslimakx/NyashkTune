@@ -1,3 +1,12 @@
+## NyashkTune 2.0.1
+
+- **No more "hanging" notes:** while the voice has already crossed into another note and the switch only waits out the guard / Tolerance time, the correction no longer keeps pulling it back to the note it is leaving (up to half a semitone for ~200 ms before). Measured over 72 runs with real and synthetic voices (clean, noise, reverb, breath): frames pulled more than a semitone away 1.7 % -> 0 %.
+- **Slides no longer stop on the notes in between:** while the note centre glides faster than 8 st/s no note is chosen on the way, and the fast "far" switch waits until the slide has stopped (a 60 -> 58 slide used to settle on 59 first). Short wrong-note blips 2.5x fewer.
+- A voice sitting just past the half-way point to the next note (42-58 c) now switches after ~50 ms instead of ~135 ms.
+- Keyboard redrawn: a NOTES row with one button per note name (in key / skipped with a strike / pitch up / pitch down / bypass), the keys show the states (darker = skipped, arrows, a blue dot for bypass), the target lights up, click a key to change its note; drag tabs on the range edges.
+- Reference / Depth / Amount knobs no longer sit under the panel titles.
+- A window size saved by 1.x is opened with the new proportions (was cut off).
+
 ## NyashkTune 2.0.0
 
 Rebuilt around the controls and the logic of a classic real-time tuner. Everything else is gone.

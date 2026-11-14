@@ -285,6 +285,24 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
             install_fonts(ctx);
         },
         move |ctx, setter, st| {
+            // developer helper for screenshots: NYASHK_DEMO_SET="key=9,scale=2,n1=3,n6=5"
+            static DEMO: std::sync::Once = std::sync::Once::new();
+            DEMO.call_once(|| {
+                for kv in std::env::var("NYASHK_DEMO_SET").unwrap_or_default().split(',') {
+                    let Some((k, v)) = kv.split_once('=') else { continue };
+                    let Ok(v) = v.trim().parse::<usize>() else { continue };
+                    match k.trim() {
+                        "key" => set_e(setter, &params.key, Key::from_index(v)),
+                        "scale" => set_e(setter, &params.scale, ScaleKind::from_index(v)),
+                        k if k.starts_with('n') => {
+                            if let Ok(pc) = k[1..].parse::<usize>() {
+                                set_e(setter, &params.notes[pc % 12].state, NoteState::from_index(v));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
             ctx.request_repaint_after(Duration::from_millis(33));
             let p = &*params;
             let flats = p.flats.load(Ordering::Relaxed) != 0;
@@ -402,7 +420,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 if pill(ui, rect(30.0, row_y + 40.0, 60.0, 24.0), if von { "ON" } else { "OFF" }, von, "On: the singer's own vibrato is kept (scaled by Depth) and only the note centre is corrected. Off: the vibrato is corrected away like any other pitch change.") {
                     set_b(setter, &p.vibrato, !von);
                 }
-                knob(ui, setter, &p.vib_depth, "DEPTH", "vibd", Pos2::new(v.right() - 70.0, row_y + 44.0), 26.0, "100 % = vibrato as sung, less = flatter, more = wider (up to 200 %).", false);
+                knob(ui, setter, &p.vib_depth, "DEPTH", "vibd", Pos2::new(v.right() - 70.0, row_y + 52.0), 24.0, "100 % = vibrato as sung, less = flatter, more = wider (up to 200 %).", false);
                 // correction
                 let cr = rect(276.0, row_y, 190.0, 122.0);
                 panel(ui, cr, "CORRECTION");
@@ -410,7 +428,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 if pill(ui, rect(292.0, row_y + 40.0, 60.0, 24.0), if con { "ON" } else { "OFF" }, con, "Switch the pitch correction on / off.") {
                     set_b(setter, &p.correction, !con);
                 }
-                knob(ui, setter, &p.amount, "AMOUNT", "amount", Pos2::new(cr.right() - 52.0, row_y + 44.0), 26.0, "How much of the correction is applied (100 % = all the way onto the note).", false);
+                knob(ui, setter, &p.amount, "AMOUNT", "amount", Pos2::new(cr.right() - 52.0, row_y + 52.0), 24.0, "How much of the correction is applied (100 % = all the way onto the note).", false);
                 // formant
                 let fm = rect(478.0, row_y, 186.0, 122.0);
                 panel(ui, fm, "FORMANT");
@@ -424,32 +442,96 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 // reference + meters
                 let rf = rect(676.0, row_y, 250.0, 122.0);
                 panel(ui, rf, "REFERENCE");
-                knob(ui, setter, &p.ref_a, "A4", "refa", Pos2::new(rf.left() + 60.0, row_y + 44.0), 26.0, "Tuning of A4 (415.3 - 466.2 Hz = +-100 cents). Match a sped-up / slowed-down beat.", true);
+                knob(ui, setter, &p.ref_a, "A4", "refa", Pos2::new(rf.left() + 60.0, row_y + 52.0), 24.0, "Tuning of A4 (415.3 - 466.2 Hz = +-100 cents). Match a sped-up / slowed-down beat.", true);
                 let cents = 1200.0 * (p.ref_a.value() / 440.0).log2();
-                painter.text(Pos2::new(rf.left() + 136.0, row_y + 50.0), Align2::LEFT_CENTER, format!("{:+.0} c", cents), mono(12.0), WHITE);
-                painter.text(Pos2::new(rf.left() + 136.0, row_y + 68.0), Align2::LEFT_CENTER, "vs 440 Hz", mono(9.0), DIM);
-                meter(ui, rect(rf.right() - 40.0, row_y + 26.0, 9.0, 76.0), st.in_lv, "IN");
-                meter(ui, rect(rf.right() - 22.0, row_y + 26.0, 9.0, 76.0), st.out_lv, "OUT");
+                painter.text(Pos2::new(rf.left() + 136.0, row_y + 54.0), Align2::LEFT_CENTER, format!("{:+.0} c", cents), mono(12.0), WHITE);
+                painter.text(Pos2::new(rf.left() + 136.0, row_y + 72.0), Align2::LEFT_CENTER, "vs 440 Hz", mono(9.0), DIM);
+                meter(ui, rect(rf.right() - 40.0, row_y + 28.0, 9.0, 74.0), st.in_lv, "IN");
+                meter(ui, rect(rf.right() - 22.0, row_y + 28.0, 9.0, 74.0), st.out_lv, "OUT");
 
                 // ================= keyboard
                 let kb = rect(14.0, 450.0, BASE_W - 28.0, 92.0);
                 panel(ui, kb, "");
-                let strip_h = 22.0;
-                let keys = Rect::from_min_max(Pos2::new(kb.left() + 10.0, kb.top() + 8.0 + strip_h + 4.0), Pos2::new(kb.right() - 10.0, kb.bottom() - 8.0));
+                let state_name = |n: NoteState| match n {
+                    NoteState::Legal | NoteState::Scale => "Legal",
+                    NoteState::Illegal => "Illegal (goes to the nearest legal note)",
+                    NoteState::Up => "Illegal - pitch up to the next legal note",
+                    NoteState::Down => "Illegal - pitch down to the next legal note",
+                    NoteState::Bypass => "Bypass (left as sung)",
+                };
+                let cycle = |setter: &ParamSetter, pc: usize, st_n: NoteState| {
+                    let next = match st_n {
+                        NoteState::Legal | NoteState::Scale => NoteState::Illegal,
+                        NoteState::Illegal => NoteState::Up,
+                        NoteState::Up => NoteState::Down,
+                        NoteState::Down => NoteState::Bypass,
+                        NoteState::Bypass => NoteState::Legal,
+                    };
+                    // what the scale gives by itself is stored as "Scale" (no asterisk)
+                    let scale_gives = if (p.scale_mask() >> pc) & 1 == 1 { NoteState::Legal } else { NoteState::Illegal };
+                    set_e(setter, &p.notes[pc].state, if next == scale_gives { NoteState::Scale } else { next });
+                };
+
+                // --- note states: one chip per note name (all octaves together)
+                let chip_y = kb.top() + 8.0;
+                painter.text(Pos2::new(kb.left() + 12.0, chip_y + 10.0), Align2::LEFT_CENTER, "NOTES", mono(10.0), DIM);
+                let chip_x0 = kb.left() + 62.0;
+                let chip_w = 52.0;
+                for pc in 0..12usize {
+                    let r = Rect::from_min_size(Pos2::new(chip_x0 + pc as f32 * (chip_w + 4.0), chip_y), Vec2::new(chip_w, 20.0));
+                    let st_n = p.note_state(pc);
+                    let resp = ui.interact(r, egui::Id::new(("nchip", pc)), Sense::click()).on_hover_text(format!(
+                        "{}: {}\nClick: Legal → Illegal → Pitch Up → Pitch Down → Bypass",
+                        nn(pc),
+                        state_name(st_n)
+                    ));
+                    let hov = resp.hovered();
+                    let (fill, stroke, txt, mark) = match st_n {
+                        NoteState::Legal | NoteState::Scale => (Color32::from_gray(if hov { 46 } else { 36 }), Color32::from_gray(70), WHITE, ""),
+                        NoteState::Illegal => (Color32::from_gray(if hov { 22 } else { 14 }), Color32::from_gray(40), Color32::from_gray(80), ""),
+                        NoteState::Up => (Color32::from_gray(if hov { 22 } else { 14 }), Color32::from_gray(40), Color32::from_gray(110), "↑"),
+                        NoteState::Down => (Color32::from_gray(if hov { 22 } else { 14 }), Color32::from_gray(40), Color32::from_gray(110), "↓"),
+                        NoteState::Bypass => (Color32::from_gray(if hov { 22 } else { 14 }), BYPASS.gamma_multiply(0.7), BYPASS, "B"),
+                    };
+                    painter.rect_filled(r, CornerRadius::same(5), fill);
+                    painter.rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0, stroke), StrokeKind::Inside);
+                    if mark.is_empty() {
+                        painter.text(r.center(), Align2::CENTER_CENTER, nn(pc), mono(10.5), txt);
+                    } else {
+                        painter.text(Pos2::new(r.center().x - 5.0, r.center().y), Align2::CENTER_CENTER, nn(pc), mono(10.5), txt);
+                        painter.text(Pos2::new(r.right() - 9.0, r.center().y), Align2::CENTER_CENTER, mark, mono(10.0), txt);
+                    }
+                    if st_n == NoteState::Illegal {
+                        // a thin line through the name: "not used"
+                        painter.hline(r.center().x - 9.0..=r.center().x + 9.0, r.center().y, Stroke::new(1.0, Color32::from_gray(80)));
+                    }
+                    if resp.clicked() {
+                        cycle(setter, pc, st_n);
+                    }
+                }
+                // legend
+                let lx = chip_x0 + 12.0 * (chip_w + 4.0) + 8.0;
+                let ly = chip_y + 10.0;
+                painter.rect_filled(Rect::from_center_size(Pos2::new(lx + 5.0, ly), Vec2::splat(8.0)), CornerRadius::same(2), Color32::from_gray(150));
+                painter.text(Pos2::new(lx + 13.0, ly), Align2::LEFT_CENTER, "in key", mono(9.0), DIM);
+                painter.rect_filled(Rect::from_center_size(Pos2::new(lx + 63.0, ly), Vec2::splat(8.0)), CornerRadius::same(2), Color32::from_gray(45));
+                painter.text(Pos2::new(lx + 71.0, ly), Align2::LEFT_CENTER, "skipped", mono(9.0), DIM);
+
+                // --- keyboard
+                let keys = Rect::from_min_max(Pos2::new(kb.left() + 10.0, kb.top() + 36.0), Pos2::new(kb.right() - 10.0, kb.bottom() - 8.0));
                 let n_white = (KB_LO..=KB_HI).filter(|m| !is_black(m.rem_euclid(12) as usize)).count() as f32;
                 let ww = keys.width() / n_white;
                 let lo = p.range_lo.value().min(p.range_hi.value());
                 let hi = p.range_lo.value().max(p.range_hi.value());
-                // x of a key
                 let mut white_i = 0.0f32;
                 let mut key_rects: Vec<(i32, Rect, bool)> = Vec::new();
                 for mnote in KB_LO..=KB_HI {
                     let pc = mnote.rem_euclid(12) as usize;
                     if is_black(pc) {
-                        let x = keys.left() + white_i * ww - ww * 0.32;
-                        key_rects.push((mnote, Rect::from_min_size(Pos2::new(x, keys.top()), Vec2::new(ww * 0.64, keys.height() * 0.6)), true));
+                        let x = keys.left() + white_i * ww - ww * 0.31;
+                        key_rects.push((mnote, Rect::from_min_size(Pos2::new(x, keys.top()), Vec2::new(ww * 0.62, keys.height() * 0.6)), true));
                     } else {
-                        key_rects.push((mnote, Rect::from_min_size(Pos2::new(keys.left() + white_i * ww, keys.top()), Vec2::new(ww - 1.0, keys.height())), false));
+                        key_rects.push((mnote, Rect::from_min_size(Pos2::new(keys.left() + white_i * ww + 0.5, keys.top()), Vec2::new(ww - 1.0, keys.height())), false));
                         white_i += 1.0;
                     }
                 }
@@ -463,37 +545,75 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                         let inside = *mnote >= lo && *mnote <= hi;
                         let pc = mnote.rem_euclid(12) as usize;
                         let st_n = p.note_state(pc);
-                        let mut fill = if *black { Color32::from_gray(if inside { 26 } else { 14 }) } else { Color32::from_gray(if inside { 205 } else { 70 }) };
+                        let used = matches!(st_n, NoteState::Legal | NoteState::Scale | NoteState::Bypass);
+                        let resp = ui.interact(*r, egui::Id::new(("key", *mnote)), Sense::click()).on_hover_text(format!(
+                            "{}{}: {}\nClick: change the state of every {}",
+                            nn(pc),
+                            mnote / 12 - 1,
+                            state_name(st_n),
+                            nn(pc)
+                        ));
+                        let mut fill = match (*black, used) {
+                            (false, true) => Color32::from_gray(214),
+                            (false, false) => Color32::from_gray(120),
+                            (true, true) => Color32::from_gray(22),
+                            (true, false) => Color32::from_gray(52),
+                        };
+                        if !inside {
+                            fill = if *black { Color32::from_gray(16) } else { Color32::from_gray(58) };
+                        }
+                        if resp.hovered() {
+                            fill = if *black { fill.gamma_multiply(1.6) } else { Color32::from_gray(235) };
+                        }
                         if Some(*mnote) == tgt_note {
-                            fill = WHITE;
+                            fill = IN_COL;
                         }
-                        if matches!(st_n, NoteState::Illegal | NoteState::Up | NoteState::Down) && inside {
-                            fill = if *black { Color32::from_rgb(40, 20, 26) } else { Color32::from_rgb(150, 120, 128) };
+                        let rr = if *black { CornerRadius { nw: 0, ne: 0, sw: 3, se: 3 } } else { CornerRadius { nw: 0, ne: 0, sw: 4, se: 4 } };
+                        painter.rect_filled(*r, rr, fill);
+                        if *black {
+                            // a little bevel
+                            painter.rect_filled(Rect::from_min_max(Pos2::new(r.left() + 2.0, r.bottom() - 4.0), Pos2::new(r.right() - 2.0, r.bottom() - 2.0)), CornerRadius::same(1), Color32::from_white_alpha(18));
                         }
-                        painter.rect_filled(*r, CornerRadius::same(2), fill);
-                        painter.rect_stroke(*r, CornerRadius::same(2), Stroke::new(1.0, Color32::from_gray(10)), StrokeKind::Inside);
+                        let foot = Pos2::new(r.center().x, r.bottom() - if *black { 9.0 } else { 7.0 });
+                        match st_n {
+                            NoteState::Up | NoteState::Down if inside => {
+                                let c = if *black { Color32::from_gray(170) } else { Color32::from_gray(35) };
+                                let d = if st_n == NoteState::Up { -1.0 } else { 1.0 };
+                                painter.add(egui::Shape::convex_polygon(
+                                    vec![Pos2::new(foot.x, foot.y + 3.0 * d), Pos2::new(foot.x + 3.5, foot.y - 2.5 * d), Pos2::new(foot.x - 3.5, foot.y - 2.5 * d)],
+                                    c,
+                                    Stroke::NONE,
+                                ));
+                            }
+                            NoteState::Bypass if inside => {
+                                painter.circle_filled(foot, 2.5, BYPASS);
+                            }
+                            _ => {}
+                        }
                         if Some(*mnote) == in_note {
-                            painter.circle_filled(Pos2::new(r.center().x, r.bottom() - 8.0), 3.5, IN_COL);
+                            painter.circle_filled(Pos2::new(r.center().x, r.bottom() - if *black { 18.0 } else { 16.0 }), 3.5, if Some(*mnote) == tgt_note { Color32::BLACK } else { IN_COL });
                         }
-                        if Some(*mnote) == tgt_note {
-                            painter.rect_stroke(r.shrink(1.0), CornerRadius::same(2), Stroke::new(2.0, if *black { WHITE } else { Color32::BLACK }), StrokeKind::Inside);
+                        if pc == 0 && !*black && *mnote > KB_LO && *mnote < KB_HI && Some(*mnote) != tgt_note && st_n != NoteState::Bypass {
+                            painter.text(Pos2::new(r.center().x, r.bottom() - 7.0), Align2::CENTER_CENTER, format!("C{}", mnote / 12 - 1), mono(8.0), Color32::from_gray(if inside { 90 } else { 40 }));
                         }
-                        if pc == 0 && !*black && *mnote > KB_LO && *mnote < KB_HI {
-                            painter.text(Pos2::new(r.center().x, r.bottom() - 9.0), Align2::CENTER_CENTER, format!("C{}", mnote / 12 - 1), mono(8.5), Color32::from_gray(60));
+                        if resp.clicked() {
+                            cycle(setter, pc, st_n);
                         }
                     }
                 }
                 // range handles (drag)
                 for (which, mnote) in [(0, lo), (1, hi)] {
-                    let kr = key_rects.iter().find(|k| k.0 == mnote).map(|k| k.1).unwrap_or(keys);
-                    let x = if which == 0 { kr.left() - 1.0 } else { kr.right() + 1.0 };
+                    let kr = key_rects.iter().find(|k| k.0 == mnote && !k.2).map(|k| k.1).or_else(|| key_rects.iter().find(|k| k.0 == mnote).map(|k| k.1)).unwrap_or(keys);
+                    let x = if which == 0 { kr.left() - 0.5 } else { kr.right() + 0.5 };
                     let hr = Rect::from_center_size(Pos2::new(x, keys.center().y), Vec2::new(12.0, keys.height() + 6.0));
                     let resp = ui.interact(hr, egui::Id::new(("range", which)), Sense::drag()).on_hover_text("Drag: correction range (notes outside it are left as sung).");
                     let col = if resp.hovered() || resp.dragged() { WHITE } else { IN_COL };
-                    painter.line_segment([Pos2::new(x, keys.top() - 3.0), Pos2::new(x, keys.bottom() + 3.0)], Stroke::new(2.0, col));
+                    painter.line_segment([Pos2::new(x, keys.top() - 2.0), Pos2::new(x, keys.bottom() + 2.0)], Stroke::new(2.0, col));
+                    // a small grab tab
+                    let tab = Rect::from_center_size(Pos2::new(x, keys.top() - 2.0), Vec2::new(8.0, 5.0));
+                    painter.rect_filled(tab, CornerRadius::same(2), col);
                     if resp.dragged() {
                         if let Some(pp) = resp.interact_pointer_pos() {
-                            // nearest key edge
                             let mut best = (mnote, f32::MAX);
                             for (k, r, black) in &key_rects {
                                 if *black {
@@ -510,47 +630,6 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                                 set_i(setter, pr, v2);
                             }
                         }
-                    }
-                }
-                // note-state strip (one cell per key, all octaves of a note together)
-                let strip = Rect::from_min_max(Pos2::new(keys.left(), kb.top() + 8.0), Pos2::new(keys.right(), kb.top() + 8.0 + strip_h));
-                for (mnote, r, black) in &key_rects {
-                    let pc = mnote.rem_euclid(12) as usize;
-                    let cell = Rect::from_min_max(Pos2::new(r.left() + 1.0, strip.top() + if *black { 0.0 } else { strip_h * 0.5 }), Pos2::new(r.right() - 1.0, if *black { strip.top() + strip_h * 0.5 - 1.0 } else { strip.bottom() }));
-                    let st_n = p.note_state(pc);
-                    let (col, sym) = match st_n {
-                        NoteState::Legal | NoteState::Scale => (Color32::from_gray(70), ""),
-                        NoteState::Illegal => (ILLEGAL, "–"),
-                        NoteState::Up => (ILLEGAL, "↑"),
-                        NoteState::Down => (ILLEGAL, "↓"),
-                        NoteState::Bypass => (BYPASS, "×"),
-                    };
-                    let resp = ui.interact(cell, egui::Id::new(("nstate", *mnote)), Sense::click()).on_hover_text(format!(
-                        "{}: {} - click: Legal → Illegal → Pitch Up → Pitch Down → Bypass (all octaves)",
-                        nn(pc),
-                        match st_n {
-                            NoteState::Legal | NoteState::Scale => "Legal",
-                            NoteState::Illegal => "Illegal (to the nearest legal note)",
-                            NoteState::Up => "Illegal - pitch up",
-                            NoteState::Down => "Illegal - pitch down",
-                            NoteState::Bypass => "Bypass (left as sung)",
-                        }
-                    ));
-                    painter.rect_filled(cell, CornerRadius::same(2), if resp.hovered() { col.gamma_multiply(1.4) } else { col });
-                    if !sym.is_empty() && cell.width() > 6.0 {
-                        painter.text(cell.center(), Align2::CENTER_CENTER, sym, mono(9.0), Color32::BLACK);
-                    }
-                    if resp.clicked() {
-                        let next = match st_n {
-                            NoteState::Legal | NoteState::Scale => NoteState::Illegal,
-                            NoteState::Illegal => NoteState::Up,
-                            NoteState::Up => NoteState::Down,
-                            NoteState::Down => NoteState::Bypass,
-                            NoteState::Bypass => NoteState::Legal,
-                        };
-                        // what the scale gives by itself is stored as "Scale" (no asterisk)
-                        let scale_gives = if (p.scale_mask() >> pc) & 1 == 1 { NoteState::Legal } else { NoteState::Illegal };
-                        set_e(setter, &p.notes[pc].state, if next == scale_gives { NoteState::Scale } else { next });
                     }
                 }
 

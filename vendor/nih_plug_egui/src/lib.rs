@@ -79,11 +79,19 @@ pub struct EguiState {
     /// Width the GUI layout is designed for (the size passed to `from_size`).
     #[serde(skip)]
     pub(crate) base_width: AtomicCell<u32>,
+    /// Height the GUI layout is designed for.
+    #[serde(skip)]
+    pub(crate) base_height: AtomicCell<u32>,
 }
 
 impl<'a> PersistentField<'a, EguiState> for Arc<EguiState> {
     fn set(&self, new_value: EguiState) {
-        self.size.store(new_value.size.load());
+        // A size saved by an older version with another layout: keep its width (the zoom) but use
+        // the current layout's proportions, or the GUI is cut off or gets an empty band.
+        let (w, _) = new_value.size.load();
+        let (bw, bh) = (self.base_width.load().max(1), self.base_height.load().max(1));
+        let w = w.max(bw / 2);
+        self.size.store((w, ((w as u64 * bh as u64 + bw as u64 / 2) / bw as u64) as u32));
     }
 
     fn map<F, R>(&self, f: F) -> R
@@ -103,6 +111,7 @@ impl EguiState {
             requested_size: Default::default(),
             open: AtomicBool::new(false),
             base_width: AtomicCell::new(width),
+            base_height: AtomicCell::new(height),
         })
     }
 
