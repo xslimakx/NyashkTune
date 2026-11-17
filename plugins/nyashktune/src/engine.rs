@@ -172,8 +172,8 @@ impl Default for Params {
             scale: 1,
             custom_mask: 0xFFF,
             ref_a: 440.0,
-            retune_ms: 15.0,
-            transition_ms: 120.0,
+            retune_ms: 5.0,
+            transition_ms: 40.0,
             amount: 1.0,
             transpose: 0.0,
             fine_cents: 0.0,
@@ -294,6 +294,7 @@ pub struct Meters {
     pub hz: f32,
     pub target: f32, // MIDI note number (0 = none)
     pub corr: f32,   // applied shift in semitones
+    pub centre: f32, // note centre the choice is made on (diagnostics)
 }
 
 pub struct Engine {
@@ -375,11 +376,19 @@ pub struct Engine {
     n_slope: f64, // the same for the lightly smoothed pitch
     centre: f64,      // note centre: vibrato taken out (midpoint of its last peak and trough)
     vib_sm: f64,      // lightly smoothed pitch the vibrato turning points are found on
+    in_vib: bool,     // the voice is in a recognised vibrato (the centre is its midpoint)
+    vib_w: f64,       // 0..1, eased: how much of (pitch - centre) is kept as vibrato
+    glide: f64,       // where the output is heading: glides onto a new note with Note Transition
+    glide_note: i32,  // the note the glide was last aimed at
+    glide_from: f64,  // where the glide started
+    glide_t: f64,     // time since it started
     ext: f64,         // running extreme since the last turning point
     ext_t: f64,
     rising: bool,
     tp_max: (f64, f64), // last peak (value, time)
     tp_min: (f64, f64), // last trough
+    tp_max_prev: (f64, f64), // the peak / trough before those: a vibrato repeats itself
+    tp_min_prev: (f64, f64),
     clock: f64,     // lightly smoothed pitch used only to *choose* the note (not to correct it)
 }
 
@@ -402,7 +411,7 @@ impl Engine {
             allowed_pc: 0xFFF,
             states: [1; 12],
             held: [false; 128],
-            meters: Meters { voiced: false, hz: 0.0, target: 0.0, corr: 0.0 },
+            meters: Meters { voiced: false, hz: 0.0, target: 0.0, corr: 0.0, centre: 0.0 },
             dbg_lag: 0.0,
             pull: 0.6,
             debug: false,
@@ -463,11 +472,19 @@ impl Engine {
             n_slope: 0.0,
             centre: 60.0,
             vib_sm: 60.0,
+            in_vib: false,
+            vib_w: 0.0,
+            glide: 0.0,
+            glide_note: i32::MIN,
+            glide_from: 0.0,
+            glide_t: 0.0,
             ext: 60.0,
             ext_t: 0.0,
             rising: true,
             tp_max: (f64::NAN, -1.0),
             tp_min: (f64::NAN, -1.0),
+            tp_max_prev: (f64::NAN, -1.0),
+            tp_min_prev: (f64::NAN, -1.0),
             clock: 0.0,
         };
         e.set_lowest_hz(lowest_hz);
@@ -521,7 +538,7 @@ impl Engine {
         self.have_note = false;
         self.was_voiced = false;
         self.transition = false;
-        self.meters = Meters { voiced: false, hz: 0.0, target: 0.0, corr: 0.0 };
+        self.meters = Meters { voiced: false, hz: 0.0, target: 0.0, corr: 0.0, centre: 0.0 };
     }
 
     pub fn set_params(&mut self, p: &Params) {
@@ -1079,6 +1096,7 @@ impl Engine {
                 self.ext = s;
                 self.ext_t = t;
             } else if s < self.ext - TURN {
+                self.tp_max_prev = self.tp_max;
                 self.tp_max = (self.ext, self.ext_t);
                 self.rising = false;
                 self.ext = s;
@@ -1088,6 +1106,7 @@ impl Engine {
             self.ext = s;
             self.ext_t = t;
         } else if s > self.ext + TURN {
+            self.tp_min_prev = self.tp_min;
             self.tp_min = (self.ext, self.ext_t);
             self.rising = true;
             self.ext = s;
@@ -1096,18 +1115,39 @@ impl Engine {
         let (hi, th) = self.tp_max;
         let (lo, tl) = self.tp_min;
         let half = (th - tl).abs();
+        // A vibrato repeats: the peak before the last one (or the trough before the last one) is
+        // at about the same height, one period earlier. A single up-down - a step to the next
+        // note with an overshoot, a scoop - is not a vibrato: taking the midpoint of the old note
+        // and the new one used to hold the centre between them for up to 0.3 s and pick the
+        // wrong note (with a key set: the scale note on the old side of an illegal one).
+        let again = |cur: (f64, f64), prev: (f64, f64)| {
+            prev.0.is_finite() && (cur.0 - prev.0).abs() < 0.45 && (0.07..=0.5).contains(&(cur.1 - prev.1))
+        };
+        let repeats = again(self.tp_max, self.tp_max_prev) || again(self.tp_min, self.tp_min_prev);
+        // (pairs across a step cannot happen: a step forgets the turning points, see forget_turns)
+        let _ = repeats;
         let vibrato = hi.is_finite()
             && lo.is_finite()
             && hi > lo
             && hi - lo < 2.0
             && (0.03..=0.25).contains(&half)
-            && t - th.max(tl) < 0.3
+            // the next turn is due within about half a period: if it does not come, the voice has
+            // settled (on this note or a new one) and the vibrato is over
+            && t - th.max(tl) < (1.4 * half).max(0.06)
             // still inside the band of its last peak and trough: after a step to another note the
             // old peak / trough must not pull the centre back half-way
             && s > lo - 0.15
             && s < hi + 0.15;
+        self.in_vib = vibrato;
         let target = if vibrato { 0.5 * (hi + lo) } else { s };
         self.centre += (target - self.centre) * (1.0 - (-dt / 0.025).exp());
+    }
+
+    fn forget_turns(&mut self) {
+        self.tp_max = (f64::NAN, -1.0);
+        self.tp_min = (f64::NAN, -1.0);
+        self.tp_max_prev = (f64::NAN, -1.0);
+        self.tp_min_prev = (f64::NAN, -1.0);
     }
 
     fn compute_ratio(&mut self, dt: f64, voiced: bool, period: f64) -> f64 {
@@ -1125,6 +1165,9 @@ impl Engine {
         let f0 = self.fs / period;
         let midi = 69.0 + 12.0 * (f0 / self.p.ref_a as f64).log2();
         if !self.was_voiced {
+            self.vib_w = 0.0;
+            self.in_vib = false;
+            self.glide_note = i32::MIN;
             self.slow_midi = midi;
             self.note_sm = midi;
             self.centre = midi;
@@ -1136,6 +1179,8 @@ impl Engine {
             self.ext = midi;
             self.tp_max = (f64::NAN, -1.0);
             self.tp_min = (f64::NAN, -1.0);
+            self.tp_max_prev = (f64::NAN, -1.0);
+            self.tp_min_prev = (f64::NAN, -1.0);
             self.have_note = false;
             self.note_age = 0.0;
             self.transition = true;
@@ -1148,11 +1193,15 @@ impl Engine {
         // would crawl through the notes in between and could settle on one of them)
         if (midi - self.note_sm).abs() > 0.8 {
             self.note_sm = midi;
+            // a step: peaks and troughs from before it belong to the old note and must not be
+            // paired with the new one into a fake vibrato midpoint
+            self.forget_turns();
         } else {
             self.note_sm += (midi - self.note_sm) * (1.0 - (-dt / 0.010).exp());
         }
         if (self.note_sm - self.centre).abs() > 1.2 {
             self.centre = self.note_sm; // left the vibrato: follow at once
+            self.forget_turns();
         }
         // how fast the note centre (vibrato taken out) is moving: a glide / scoop between notes
         if dt > 0.0 {
@@ -1173,12 +1222,38 @@ impl Engine {
         if self.pick_note(basis, midi, dt) {
             // Vibrato On: the centre goes onto the note and the singer's vibrato rides on top,
             // scaled by Depth (0 flat, 1 as sung, 2 twice as wide). Off: the pitch itself is corrected.
-            err = if keep {
-                let d = (self.p.vib_amount as f64).clamp(0.0, 2.0);
-                self.cur_note as f64 - self.centre + (d - 1.0) * (midi - self.centre)
-            } else {
-                self.cur_note as f64 - midi
-            };
+            // Only a real vibrato (a regular oscillation, recognised by track_centre) is kept. Any
+            // other movement - a wobbly, drifting, unsteady voice - is corrected like with Vibrato
+            // Off: keeping everything that was not the slow centre let an untrained voice through
+            // almost uncorrected (with a key set it sounded like the tuner missed every note).
+            // The switch between the two is eased over ~60 ms so a vibrato fades in and out.
+            let want_w = if keep && self.in_vib { 1.0 } else { 0.0 };
+            self.vib_w += (want_w - self.vib_w) * (1.0 - (-dt / 0.06).exp());
+            let d = (self.p.vib_amount as f64).clamp(0.0, 2.0);
+            // Note Transition shapes only the move from one note to the next: on a new note the
+            // glide starts where the output is right now and eases onto the new note. Inside a
+            // note the voice is always held on the glide with Speed. (Before, the whole
+            // correction ran on the slow transition time for most of every note, so a wobbly
+            // voice was hardly corrected - "the tuner misses every note".)
+            if self.cur_note != self.glide_note {
+                let now = midi + self.corr_sm;
+                // (the octave the output is in does not matter: keep the glide near the note)
+                self.glide = now - 12.0 * ((now - self.cur_note as f64) / 12.0).round();
+                if self.glide_note == i32::MIN {
+                    self.glide = self.cur_note as f64 + (midi - self.cur_note as f64).clamp(-1.0, 1.0);
+                }
+                self.glide_note = self.cur_note;
+                self.glide_from = self.glide;
+                self.glide_t = 0.0;
+            }
+            // the glide takes exactly Note Transition: smooth start, smooth landing, then it is on
+            // the note (an exponential with that time constant needed 3x as long to get there)
+            let tr = self.p.transition_ms as f64 / 1000.0;
+            self.glide_t += dt;
+            let u = if tr < 0.0005 { 1.0 } else { (self.glide_t / tr).min(1.0) };
+            let ease = u * u * (3.0 - 2.0 * u);
+            self.glide = self.glide_from + (self.cur_note as f64 - self.glide_from) * ease;
+            err = self.glide - midi + self.vib_w * d * (midi - self.centre);
             // the correction never needs to move the voice by an octave: taken modulo 12, a
             // detector octave slip or a register flip costs nothing
             err -= 12.0 * (err / 12.0).round();
@@ -1191,7 +1266,8 @@ impl Engine {
 
         // glide time: Note Transition while moving onto a newly selected note,
         // Speed for settling inside a note
-        let tau = if self.transition { self.p.transition_ms } else { self.p.retune_ms } as f64 / 1000.0;
+        // (the move between notes is already in the glide; this is the Speed of holding the voice)
+        let tau = self.p.retune_ms as f64 / 1000.0;
         // While the voice has crossed into another note's half and the switch is only waiting out
         // the guard / Tolerance time, do not pull it any harder back to the note it is leaving
         // (that was the "note hangs and drags" feeling: up to half a semitone of pull for 200 ms).
@@ -1205,7 +1281,11 @@ impl Engine {
         }
         // the transition is over once the correction has arrived (within ~5 cents)
         // (and the pitch measurement has had ~80 ms to settle after the note change)
-        if self.transition && self.note_age > 0.08 && (err - self.corr_sm).abs() < 0.05 {
+        // A wobbly real voice never sits still long enough for "within 5 cents", and the whole
+        // note used to stay in the slow transition glide (the tuner seemed to miss every note):
+        // the transition also ends after twice its own time, then Speed takes over.
+        let tr_s = self.p.transition_ms as f64 / 1000.0;
+        if self.transition && self.note_age > 0.08 && ((err - self.corr_sm).abs() < 0.05 || self.note_age > 0.08 + 2.0 * tr_s) {
             self.transition = false;
         }
 
@@ -1240,6 +1320,7 @@ impl Engine {
         self.meters.hz = f0 as f32;
         self.meters.target = if self.have_note { self.cur_note as f32 } else { 0.0 };
         self.meters.corr = total as f32;
+        self.meters.centre = self.centre as f32;
         2f64.powf(total / 12.0)
     }
 

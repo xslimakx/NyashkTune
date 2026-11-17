@@ -1,3 +1,12 @@
+## NyashkTune 2.0.2
+
+Correction with a key set fixed: on real singing it used to land on the scale notes barely more often than the raw voice (about 35 % of the time); now 60-65 % with the default settings and about 80 % with Speed and Note Transition at 0.
+
+- **Vibrato On keeps only a real vibrato:** before it let through any movement that was not the slow note centre, so a wavering voice was hardly corrected. Now an unsteady voice is corrected and only a regular vibrato rides on top.
+- **No wrong note after a step:** the end of one note and the start of the next were taken for a vibrato, and the midpoint between the two notes picked the wrong one. The turning points are forgotten on a step, and a vibrato ends when its next turn does not come.
+- **Note Transition glides from where the voice is to the new note in exactly the set time;** inside a note the voice is held with Speed. A wobbly voice no longer spends the whole note in the slow transition.
+- **New defaults:** Speed 5 ms (was 15), Note Transition 40 ms (was 120). Saved projects keep their own settings.
+
 ## NyashkTune 2.0.1
 
 - **No more "hanging" notes:** while the voice has already crossed into another note and the switch only waits out the guard / Tolerance time, the correction no longer keeps pulling it back to the note it is leaving (up to half a semitone for ~200 ms before). Measured over 72 runs with real and synthetic voices (clean, noise, reverb, breath): frames pulled more than a semitone away 1.7 % -> 0 %.

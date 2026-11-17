@@ -42,7 +42,7 @@ fn main() {
             out.push(e.process_frame([s, s], 1)[0]);
         }
         let m = &e.meters;
-        writeln!(csv, "{:.5},{},{:.3},{},{:.4}", i as f64 * 64.0 / fs, m.voiced as u8, m.hz, m.target, m.corr).unwrap();
+        writeln!(csv, "{:.5},{},{:.3},{},{:.4},{:.3}", i as f64 * 64.0 / fs, m.voiced as u8, m.hz, m.target, m.corr, m.centre).unwrap();
     }
     let out = &out[lat..lat + x.len()];
     let mut f = std::io::BufWriter::new(std::fs::File::create(&a[2]).unwrap());

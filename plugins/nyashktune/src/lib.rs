@@ -266,8 +266,8 @@ impl Default for NyashkTuneParams {
 
             bypass: BoolParam::new("Bypass", false).make_bypass(),
 
-            speed: FloatParam::new("Speed", 15.0, ms_range()).with_unit(" ms").with_step_size(0.1).with_value_to_string(ms_text()),
-            transition: FloatParam::new("Note Transition", 120.0, ms_range()).with_unit(" ms").with_step_size(0.1).with_value_to_string(ms_text()),
+            speed: FloatParam::new("Speed", 5.0, ms_range()).with_unit(" ms").with_step_size(0.1).with_value_to_string(ms_text()),
+            transition: FloatParam::new("Note Transition", 40.0, ms_range()).with_unit(" ms").with_step_size(0.1).with_value_to_string(ms_text()),
             link: BoolParam::new("Link", false),
             tol_cents: FloatParam::new("Tolerance Cents", 0.0, lin(0.0, 40.0))
                 .with_step_size(1.0)
@@ -571,10 +571,10 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_waves_like() {
+    fn defaults_correct_firmly() {
         let p = NyashkTuneParams::default();
-        assert!((p.speed.value() - 15.0).abs() < 0.01);
-        assert!((p.transition.value() - 120.0).abs() < 0.01);
+        assert!((p.speed.value() - 5.0).abs() < 0.01);
+        assert!((p.transition.value() - 40.0).abs() < 0.01);
         assert!(p.vibrato.value() && (p.vib_depth.value() - 100.0).abs() < 0.01);
         let e = p.engine_params();
         assert!(!e.voices_on && !e.colour_on && !e.vib_on);
