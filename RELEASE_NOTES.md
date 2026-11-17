@@ -1,3 +1,7 @@
+## NyashkTune 2.0.3
+
+- Transpose far down (around -9 to -12 st) works: the same grain fix as NyashkFormant 1.0.3 (it came out near the original pitch before).
+
 ## NyashkTune 2.0.2
 
 Correction with a key set fixed: on real singing it used to land on the scale notes barely more often than the raw voice (about 35 % of the time); now 60-65 % with the default settings and about 80 % with Speed and Note Transition at 0.
