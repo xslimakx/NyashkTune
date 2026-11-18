@@ -1456,7 +1456,24 @@ impl Engine {
         let follow = if self.p.formant_preserve { 0.0 } else { self.p.formant_follow as f64 };
         let s_raw = if self.p.formant_on { 2f64.powf((self.p.formant_semis + vformant) as f64 / 12.0) * r.powf(follow) } else { 1.0 };
         let mode = self.p.formant_mode;
-        let spectral = mode != FormantMode::Classic && s_raw.ln().abs() > 0.002 && (2 * hg) as usize <= self.gbuf[0].len();
+        let fits = (2 * hg) as usize <= self.gbuf[0].len();
+        // Formant-preserving pitch shift (Classic mode, Formant Correction on). Plain PSOLA reads
+        // every grain at rate 1 and only moves the grains: the harmonics line up, but everything
+        // between them (breath, air, the noisy part of the voice) adds up out of phase between
+        // overlapping grains and loses ~1.5-2.5 dB above 3 kHz whenever the pitch is moved.
+        // Instead the grain is resampled by the pitch ratio - then neighbouring grains read
+        // exactly the same input samples and add up coherently, like with no shift at all - and
+        // the formants that the resampling moved are put back with the spectral envelope.
+        let hybrid = mode == FormantMode::Classic
+            && self.p.formant_on
+            && self.p.formant_preserve
+            && voiced
+            && r.ln().abs() > 0.002
+            && (r - 1.0).abs() < 1.0
+            && fits
+            && m as f64 + (hg as f64 + 3.0) * r <= (self.w - 1) as f64;
+        let spectral = hybrid || (mode != FormantMode::Classic && s_raw.ln().abs() > 0.002 && fits);
+        let (read_rate, env_s, env_mode) = if hybrid { (r, s_raw / r, FormantMode::Smooth) } else { (1.0, s_raw, mode) };
         let s_cl = if mode == FormantMode::Classic { s_raw.clamp(0.5, 2.0) } else { 1.0 };
 
         let tc = sy.next_centre;
@@ -1482,19 +1499,20 @@ impl Engine {
             self.add_classic(nch, m, f, hg, kmin, oi, scale, s_cl, gain, dly);
         } else {
             let l = (2 * hg) as usize;
-            let s = s_raw.clamp(0.4, 2.5);
-            let tilt = self.p.formant_tilt as f64;
+            let s = env_s.clamp(0.4, 2.5);
+            let tilt = if hybrid { 0.0 } else { self.p.formant_tilt as f64 };
             for ch in 0..nch {
                 for j in 0..l {
                     let u = (j as i64 - hg) as f64 - f;
                     let wv = (scale * 0.5 * (1.0 + (PI * u / hg as f64).cos())) as f32;
-                    self.gbuf[ch][j] = wv * self.read_cubic(ch, m as f64 + u);
+                    self.gbuf[ch][j] = wv * self.read_cubic(ch, m as f64 + u * read_rate);
                 }
             }
             let ok = {
                 let (g0, g1) = self.gbuf.split_at_mut(1);
                 let right = if nch == 2 { Some(&mut g1[0][..l]) } else { None };
-                self.shifter.process2(&mut g0[0][..l], right, p, self.fs, mode, s, tilt)
+                // a resampled grain has the pitch period of the output
+                self.shifter.process2(&mut g0[0][..l], right, p / read_rate, self.fs, env_mode, s, tilt)
             };
             if ok {
                 for k in kmin..hg {
@@ -1504,7 +1522,8 @@ impl Engine {
                     }
                 }
             } else {
-                self.add_classic(nch, m, f, hg, kmin, oi, scale, s.clamp(0.5, 2.0), gain, dly);
+                let s_fb = if hybrid { s_cl } else { s.clamp(0.5, 2.0) };
+                self.add_classic(nch, m, f, hg, kmin, oi, scale, s_fb, gain, dly);
             }
         }
 

@@ -1837,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "nyashktune"
-version = "2.0.4"
+version = "2.0.6"
 dependencies = [
  "baseview",
  "nih_plug",
