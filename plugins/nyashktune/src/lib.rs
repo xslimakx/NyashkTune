@@ -103,7 +103,7 @@ impl VoiceRange {
     pub fn notes(self) -> (i32, i32) {
         match self {
             VoiceRange::Generic => (36, 84),  // C2 .. C6
-            VoiceRange::Bass => (36, 64),     // C2 .. E4
+            VoiceRange::Bass => (31, 64),     // G1 .. E4 (also a voice pitched down an octave)
             VoiceRange::Baritone => (40, 67), // E2 .. G4
             VoiceRange::Tenor => (45, 72),    // A2 .. C5
             VoiceRange::Alto => (50, 77),     // D3 .. F5
@@ -323,7 +323,8 @@ impl NyashkTuneParams {
     /// lowest fundamental searched for: a little under the range
     pub fn lowest_hz(&self) -> f32 {
         let lo = self.range_lo.value().min(self.range_hi.value()) as f32 - 3.0;
-        (440.0 * 2f32.powf((lo - 69.0) / 12.0)).clamp(50.0, 400.0)
+        // (down to 40 Hz: a voice pitched down an octave sits around 45-75 Hz)
+        (440.0 * 2f32.powf((lo - 69.0) / 12.0)).clamp(40.0, 400.0)
     }
 
     pub fn engine_params(&self) -> engine::Params {
