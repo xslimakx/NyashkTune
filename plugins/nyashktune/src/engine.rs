@@ -690,7 +690,11 @@ impl Engine {
     // YIN pitch frames
     // --------------------------------------------------------------------------------------
     fn run_yin(&mut self) {
-        let min_tau = ((self.fs_dec / self.p.max_hz.clamp(200.0, 2000.0) as f64) as usize).max(2);
+        // Always look up to at least 1600 Hz (about G6): a voice above the search range is read an
+        // octave low, and the grains then come out an octave low too - the "jumps an octave for no
+        // reason" on high notes, falsetto or a range set too low. The range still decides which
+        // notes are corrected.
+        let min_tau = ((self.fs_dec / self.p.max_hz.clamp(1600.0, 2000.0) as f64) as usize).max(2);
         let max_tau = (((self.fs_dec / self.p.min_hz.max(40.0) as f64) as usize) + 2).min(600);
         let need = YIN_W + max_tau + 2;
         if (self.dec_w as usize) < need {
@@ -735,7 +739,11 @@ impl Engine {
         }
         let cands = &cands[..nc];
 
-        let mut best: Option<(usize, f32)> = cands.iter().copied().find(|c| c.1 < 0.15);
+        // YIN's "first dip under the threshold", but only a dip that is about as clean as the best
+        // one: a shallow dip at half the period (strong 2nd harmonic) used to win and start the
+        // note an octave high
+        let dmin = cands.iter().map(|c| c.1).fold(1.0f32, f32::min);
+        let mut best: Option<(usize, f32)> = cands.iter().copied().find(|c| c.1 < 0.15 && c.1 < dmin + 0.05);
         if best.is_none() {
             best = cands.iter().copied().filter(|c| c.1 < 0.30).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         }
@@ -762,6 +770,30 @@ impl Engine {
             }
         }
 
+        // octave check on the pick: a clear dip at half the period means the pick was two periods
+        // (the note would start an octave low): take the shorter one. (The opposite case - a
+        // shallow dip at half the true period winning - is handled by the first-dip rule above.)
+        if let Some((tau, v)) = best {
+            let dip_near = |t: f32| -> Option<(usize, f32)> {
+                cands.iter().copied().filter(|c| (c.0 as f32 / t).ln().abs() < 0.06).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            };
+            if let Some(h) = dip_near(tau as f32 * 0.5) {
+                if h.1 < 0.2 && h.1 < v + 0.06 {
+                    best = Some(h);
+                }
+            }
+        }
+        // a weak dip exactly an octave away from the period we are following is a transition
+        // smear (two notes / a consonant in one window), not a real octave move: skip the frame
+        // instead of jumping (a real leap shows a clean dip within a few ms)
+        if let Some((tau, v)) = best {
+            if self.prev_tau > 0.0 && v > 0.12 {
+                let r = (tau as f32 / self.prev_tau).ln().abs();
+                if (r - std::f32::consts::LN_2).abs() < 0.08 {
+                    best = None;
+                }
+            }
+        }
         let gate_open = rms_db > self.p.gate_db as f64;
         let mut frame = Frame { time: self.w, period: self.last_period as f32, voiced: false };
         if let (Some((tau, _)), true) = (best, gate_open) {
@@ -1499,6 +1531,68 @@ impl Engine {
 #[cfg(test)]
 mod fuzz_tests {
     use super::*;
+
+    /// Octave safety of the detector: notes above the search range (the range only decides what
+    /// is corrected) and note onsets where the 2nd harmonic is the strongest partial (formant on
+    /// it, fundamental weak) must not be read an octave off - the grains would come out an
+    /// octave off too ("jumps an octave for no reason").
+    #[test]
+    fn no_octave_errors_high_notes_and_weak_fundamental() {
+        let fs = 48000.0;
+        // a pulse train through a resonance at 2 x f0: the 2nd harmonic dominates
+        let voice = |notes: &[f64], secs_each: f64, res_mult: f64| -> (Vec<f32>, Vec<f64>) {
+            let n_each = (fs * secs_each) as usize;
+            let (mut ph, mut y1, mut y2) = (0.0f64, 0.0f64, 0.0f64);
+            let (mut out, mut truth) = (Vec::new(), Vec::new());
+            for (k, &m) in notes.iter().enumerate() {
+                let f0 = 440.0 * 2f64.powf((m - 69.0) / 12.0);
+                for i in 0..n_each {
+                    let g = ((i as f64 / (0.02 * fs)).min(1.0)) * (((n_each - i) as f64 / (0.03 * fs)).min(1.0));
+                    let vib = 1.0 + 0.004 * (2.0 * PI * 5.5 * (k * n_each + i) as f64 / fs).sin();
+                    ph = (ph + f0 * vib / fs) % 1.0;
+                    let src = if ph < 0.08 { 1.0 } else { -0.08 / 0.92 };
+                    let r = 0.97;
+                    let th = 2.0 * PI * (f0 * res_mult).min(fs * 0.4) / fs;
+                    let y = src * 0.1 + 2.0 * r * th.cos() * y1 - r * r * y2;
+                    y2 = y1;
+                    y1 = y;
+                    out.push((y * g) as f32);
+                    truth.push(if g > 0.99 { f0 } else { 0.0 });
+                }
+            }
+            let pk = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            (out.iter().map(|v| v / pk * 0.5).collect(), truth)
+        };
+        for (name, notes, res, max_hz) in [
+            ("high notes above the range", vec![84.0, 86.0, 88.0, 86.0, 84.0], 1.0, 1100.0f32),
+            ("weak fundamental, female", vec![64.0, 67.0, 69.0, 72.0, 69.0], 2.0, 1100.0),
+            ("weak fundamental, male", vec![45.0, 48.0, 50.0, 52.0, 48.0], 2.0, 1100.0),
+        ] {
+            let (x, truth) = voice(&notes, 0.5, res);
+            let mut e = Engine::new(fs, 60.0);
+            let mut p = Params::default();
+            p.min_hz = 60.0;
+            p.max_hz = max_hz;
+            let (mut bad, mut total) = (0, 0);
+            let lat = e.latency_samples() as usize;
+            for (i, ch) in x.chunks(64).enumerate() {
+                e.set_params(&p);
+                for &s in ch {
+                    e.process_frame([s, s], 1);
+                }
+                // the meter belongs to the audio coming out now (one latency ago)
+                let t = (i * 64).saturating_sub(lat);
+                if e.meters.voiced && truth.get(t).copied().unwrap_or(0.0) > 0.0 {
+                    total += 1;
+                    if (e.meters.hz as f64 / truth[t]).log2().abs() > 0.5 {
+                        bad += 1;
+                    }
+                }
+            }
+            println!("{name}: {bad} of {total} blocks an octave off");
+            assert!(total > 100 && bad == 0, "{name}: {bad} of {total} blocks an octave off");
+        }
+    }
 
     fn xorshift(s: &mut u32) -> f32 {
         *s ^= *s << 13;
