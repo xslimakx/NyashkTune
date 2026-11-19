@@ -21,3 +21,6 @@ standalone = ["nih_plug/standalone"]
 name = "nyashktune"
 path = "src/main.rs"
 required-features = ["standalone"]
+
+[dev-dependencies]
+x11rb = "0.13"

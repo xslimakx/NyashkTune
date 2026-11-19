@@ -207,7 +207,8 @@ impl Drop for EguiEditorHandle {
         self.egui_state.open.store(false, Ordering::Release);
         // XXX: This should automatically happen when the handle gets dropped, but apparently not
         self.window.close();
-        // Let the window thread finish before the host can open the editor again.
-        baseview::wait_for_windows(std::time::Duration::from_millis(1000));
+        // Let this editor's own window thread finish before the host can open it again (other
+        // plugin instances are not waited for).
+        self.window.wait_closed(std::time::Duration::from_millis(1000));
     }
 }

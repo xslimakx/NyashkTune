@@ -36,6 +36,14 @@ impl WindowHandle {
     pub fn is_open(&self) -> bool {
         self.window_handle.is_open()
     }
+
+    /// Wait (at most `timeout`) until this window has fully ended (Linux: its own thread).
+    pub fn wait_closed(&self, timeout: std::time::Duration) {
+        #[cfg(target_os = "linux")]
+        self.window_handle.wait_closed(timeout);
+        #[cfg(not(target_os = "linux"))]
+        let _ = timeout;
+    }
 }
 
 unsafe impl HasRawWindowHandle for WindowHandle {

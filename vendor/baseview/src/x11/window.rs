@@ -33,6 +33,8 @@ pub struct WindowHandle {
     raw_window_handle: Option<RawWindowHandle>,
     close_requested: Arc<AtomicBool>,
     is_open: Arc<AtomicBool>,
+    /// true while this window's own thread is running (cleared when it has fully ended)
+    thread_alive: Arc<AtomicBool>,
 }
 
 impl WindowHandle {
@@ -48,6 +50,18 @@ impl WindowHandle {
 
     pub fn is_open(&self) -> bool {
         self.is_open.load(Ordering::Relaxed)
+    }
+
+    /// Wait (at most `timeout`) until this window's thread has ended. Only this window: other
+    /// plugin instances in the same host process keep running and are never waited for.
+    pub fn wait_closed(&self, timeout: std::time::Duration) {
+        let start = std::time::Instant::now();
+        while self.thread_alive.load(Ordering::SeqCst) && start.elapsed() < timeout {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if self.thread_alive.load(Ordering::SeqCst) {
+            crate::nylog("wait_closed: window thread still alive after the timeout");
+        }
     }
 }
 
@@ -77,6 +91,7 @@ impl ParentHandle {
             raw_window_handle: None,
             close_requested: Arc::clone(&close_requested),
             is_open: Arc::clone(&is_open),
+            thread_alive: Arc::new(AtomicBool::new(true)),
         };
 
         (Self { close_requested, is_open }, handle)
@@ -144,10 +159,19 @@ impl<'a> Window<'a> {
         let (parent_handle, mut window_handle) = ParentHandle::new();
 
         crate::nylog(&format!("open_parented parent={parent_id}"));
-        crate::wait_for_windows(std::time::Duration::from_millis(1500));
+        // (no waiting for other windows here: every plugin instance has its own window thread;
+        // a reopened editor already waited for its own previous window when that was dropped)
         let live_guard = crate::LiveWindowGuard::new();
+        let thread_alive = Arc::clone(&window_handle.thread_alive);
         thread::spawn(move || {
             let _live_guard = live_guard;
+            struct Alive(Arc<AtomicBool>);
+            impl Drop for Alive {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _alive = Alive(thread_alive);
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 Self::window_thread(Some(parent_id), options, build, tx.clone(), Some(parent_handle))
             }));
