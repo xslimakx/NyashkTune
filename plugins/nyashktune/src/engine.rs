@@ -219,6 +219,8 @@ pub const MAX_CH: usize = 2;
 const YIN_W: usize = 320; // integration window on the decimated signal
 const YIN_HOP: usize = 64; // decimated samples between pitch frames (~4 ms)
 const FRAME_RING: usize = 1024;
+/// Fixed-point scale of the pitch-search copy (2^24: -144 dB resolution, no overflow up to +12 dBFS).
+const YQ_SCALE: f32 = 16_777_216.0;
 const MARK_RING: usize = 1024;
 
 #[derive(Clone, Copy, Default)]
@@ -329,6 +331,13 @@ pub struct Engine {
     since_yin: usize,
     yin_buf: Vec<f32>,
     yin_d: Vec<f32>,
+    /// Quantised copy of the decimated signal and the YIN difference sums kept up to date sample by
+    /// sample (exact integer arithmetic, so adding and removing terms never drifts). The pitch
+    /// search then only reads them, instead of doing ~130 k multiply-adds in a single sample every
+    /// 4 ms - that burst made some audio blocks several times heavier than the rest.
+    yq: Vec<i32>,
+    ysum: Vec<i64>,
+    ytau: usize,
     prev_tau: f32,
     unvoiced_run: u32,
     frames: Vec<Frame>,
@@ -433,6 +442,9 @@ impl Engine {
             since_yin: 0,
             yin_buf: Vec::with_capacity(2048),
             yin_d: Vec::with_capacity(2048),
+            yq: vec![0; 8192],
+            ysum: vec![0; 640],
+            ytau: 0,
             prev_tau: 0.0,
             unvoiced_run: 100,
             frames: vec![Frame::default(); FRAME_RING],
@@ -512,6 +524,8 @@ impl Engine {
         self.dec.iter_mut().for_each(|v| *v = 0.0);
         self.w = 0;
         self.dec_w = 0;
+        self.yq.iter_mut().for_each(|v| *v = 0);
+        self.ytau = 0;
         self.dec_acc = 0.0;
         self.dec_cnt = 0;
         self.since_yin = 0;
@@ -600,6 +614,7 @@ impl Engine {
         self.dec_cnt += 1;
         if self.dec_cnt == self.decim {
             self.dec[(self.dec_w & 4095) as usize] = (self.dec_acc / self.decim as f64) as f32;
+            self.yin_push();
             self.dec_w += 1;
             self.dec_acc = 0.0;
             self.dec_cnt = 0;
@@ -689,6 +704,47 @@ impl Engine {
     // --------------------------------------------------------------------------------------
     // YIN pitch frames
     // --------------------------------------------------------------------------------------
+    /// Slide the difference sums by the newest decimated sample (written at `dec_w`).
+    #[inline]
+    fn yin_push(&mut self) {
+        let n = self.dec_w;
+        let v = self.dec[(n & 4095) as usize];
+        let q = (v.clamp(-4.0, 4.0) * YQ_SCALE) as i32;
+        // mirrored ring (every sample stored twice) so the lags below are one contiguous slice
+        let i = (n & 4095) as usize;
+        self.yq[i] = q;
+        self.yq[i + 4096] = q;
+        let t = self.ytau;
+        if t == 0 {
+            return;
+        }
+        let (base, bw) = (i + 4096, ((n - YIN_W as i64) & 4095) as usize + 4096);
+        let q_old = self.yq[bw] as i64;
+        let (r1, r2) = (&self.yq[base - t..base], &self.yq[bw - t..bw]);
+        // r1[t - tau] is the sample `tau` before the newest one
+        for ((d, &x1), &x2) in self.ysum[1..=t].iter_mut().zip(r1.iter().rev()).zip(r2.iter().rev()) {
+            let a = q as i64 - x1 as i64;
+            let b = q_old - x2 as i64;
+            *d += a * a - b * b;
+        }
+    }
+
+    /// Exact difference sums for the window ending at the newest sample (only when the lag range
+    /// changes - a parameter change - or right after a reset).
+    fn yin_recompute(&mut self, max_tau: usize) {
+        let t_new = self.dec_w - 1;
+        for tau in 1..=max_tau {
+            let mut acc = 0i64;
+            for j in 0..YIN_W as i64 {
+                let k = t_new - j;
+                let a = self.yq[(k & 4095) as usize] as i64 - self.yq[((k - tau as i64) & 4095) as usize] as i64;
+                acc += a * a;
+            }
+            self.ysum[tau] = acc;
+        }
+        self.ytau = max_tau;
+    }
+
     fn run_yin(&mut self) {
         // Always look up to at least 1600 Hz (about G6): a voice above the search range is read an
         // octave low, and the grains then come out an octave low too - the "jumps an octave for no
@@ -714,17 +770,14 @@ impl Engine {
 
         self.yin_d.clear();
         self.yin_d.resize(max_tau + 2, 1.0);
+        if self.ytau != max_tau {
+            self.yin_recompute(max_tau);
+        }
         let mut running = 0.0f64;
         for tau in 1..=max_tau {
-            let x0 = &self.yin_buf[(need - YIN_W - tau)..(need - tau)];
-            let x1 = &self.yin_buf[(need - YIN_W)..need];
-            let mut d = 0.0f32;
-            for j in 0..YIN_W {
-                let df = x0[j] - x1[j];
-                d += df * df;
-            }
-            running += d as f64;
-            self.yin_d[tau] = (d as f64 * tau as f64 / (running + 1e-12)) as f32;
+            let d = self.ysum[tau] as f64 * (1.0 / (YQ_SCALE as f64 * YQ_SCALE as f64));
+            running += d;
+            self.yin_d[tau] = (d * tau as f64 / (running + 1e-12)) as f32;
         }
 
         // candidates = local minima
@@ -1386,9 +1439,13 @@ impl Engine {
     /// Classic time-domain grain: read the source at rate `s` (moves formants with the resampling).
     #[allow(clippy::too_many_arguments)]
     fn add_classic(&mut self, nch: usize, m: i64, f: f64, hg: i64, kmin: i64, oi: i64, scale: f64, s: f64, gain: [f32; MAX_CH], dly: i64) {
+        let dth = PI / hg as f64;
+        let (sd, cd) = dth.sin_cos();
+        let (mut sn, mut cs) = (PI * (kmin as f64 - f) / hg as f64).sin_cos();
         for k in kmin..hg {
             let u = k as f64 - f;
-            let wv = (scale * 0.5 * (1.0 + (PI * u / hg as f64).cos())) as f32;
+            let wv = (scale * 0.5 * (1.0 + cs)) as f32;
+            (cs, sn) = (cs * cd - sn * sd, sn * cd + cs * sd);
             let sp = m as f64 + u * s;
             let idx = ((oi + k + dly) & self.ring_mask) as usize;
             for ch in 0..nch {
@@ -1501,12 +1558,17 @@ impl Engine {
             let l = (2 * hg) as usize;
             let s = env_s.clamp(0.4, 2.5);
             let tilt = if hybrid { 0.0 } else { self.p.formant_tilt as f64 };
-            for ch in 0..nch {
-                for j in 0..l {
-                    let u = (j as i64 - hg) as f64 - f;
-                    let wv = (scale * 0.5 * (1.0 + (PI * u / hg as f64).cos())) as f32;
+            // Hann window by rotation (one cos/sin per grain instead of one cos per sample and channel)
+            let dth = PI / hg as f64;
+            let (sd, cd) = dth.sin_cos();
+            let (mut sn, mut cs) = (PI * (-hg as f64 - f) / hg as f64).sin_cos();
+            for j in 0..l {
+                let u = (j as i64 - hg) as f64 - f;
+                let wv = (scale * 0.5 * (1.0 + cs)) as f32;
+                for ch in 0..nch {
                     self.gbuf[ch][j] = wv * self.read_cubic(ch, m as f64 + u * read_rate);
                 }
+                (cs, sn) = (cs * cd - sn * sd, sn * cd + cs * sd);
             }
             let ok = {
                 let (g0, g1) = self.gbuf.split_at_mut(1);

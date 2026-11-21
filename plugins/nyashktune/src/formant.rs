@@ -38,79 +38,58 @@ impl FormantMode {
 }
 
 /// In-place radix-2 complex FFT on f64 slices, with a twiddle table for the maximum size.
+/// Power-of-two complex FFT on split re/im arrays. All sizes up to `max_n` are planned (and their
+/// scratch allocated) up front, so a transform on the audio thread never allocates. rustfft picks
+/// the SIMD (AVX / SSE / NEON) kernels at run time.
 pub struct Fft {
     max_n: usize,
-    tw_re: Vec<f64>,
-    tw_im: Vec<f64>,
+    fwd: Vec<std::sync::Arc<dyn rustfft::Fft<f64>>>, // index = log2(n)
+    inv: Vec<std::sync::Arc<dyn rustfft::Fft<f64>>>,
+    buf: Vec<rustfft::num_complex::Complex<f64>>,
+    scratch: Vec<rustfft::num_complex::Complex<f64>>,
 }
 
 impl Fft {
     pub fn new(max_n: usize) -> Self {
         assert!(max_n.is_power_of_two() && max_n >= 4);
-        let mut tw_re = Vec::with_capacity(max_n / 2);
-        let mut tw_im = Vec::with_capacity(max_n / 2);
-        for k in 0..max_n / 2 {
-            let a = 2.0 * PI * k as f64 / max_n as f64;
-            tw_re.push(a.cos());
-            tw_im.push(-a.sin());
+        let mut planner = rustfft::FftPlanner::<f64>::new();
+        let (mut fwd, mut inv) = (Vec::new(), Vec::new());
+        let mut scratch_len = 0;
+        for lg in 0..=max_n.trailing_zeros() {
+            let n = 1usize << lg;
+            let f = planner.plan_fft_forward(n);
+            let i = planner.plan_fft_inverse(n);
+            scratch_len = scratch_len.max(f.get_inplace_scratch_len()).max(i.get_inplace_scratch_len());
+            fwd.push(f);
+            inv.push(i);
         }
-        Self { max_n, tw_re, tw_im }
+        let z = rustfft::num_complex::Complex::new(0.0, 0.0);
+        Self { max_n, fwd, inv, buf: vec![z; max_n], scratch: vec![z; scratch_len.max(1)] }
     }
 
-    pub fn forward(&self, re: &mut [f64], im: &mut [f64]) {
+    pub fn forward(&mut self, re: &mut [f64], im: &mut [f64]) {
         self.run(re, im, false);
     }
 
     /// Inverse transform including the 1/n scaling.
-    pub fn inverse(&self, re: &mut [f64], im: &mut [f64]) {
+    pub fn inverse(&mut self, re: &mut [f64], im: &mut [f64]) {
         self.run(re, im, true);
-        let s = 1.0 / re.len() as f64;
-        for v in re.iter_mut() {
-            *v *= s;
-        }
-        for v in im.iter_mut() {
-            *v *= s;
-        }
     }
 
-    fn run(&self, re: &mut [f64], im: &mut [f64], inv: bool) {
+    fn run(&mut self, re: &mut [f64], im: &mut [f64], inv: bool) {
         let n = re.len();
         debug_assert!(n.is_power_of_two() && n <= self.max_n && im.len() == n);
-        // bit reversal
-        let mut j = 0usize;
-        for i in 1..n {
-            let mut bit = n >> 1;
-            while j & bit != 0 {
-                j ^= bit;
-                bit >>= 1;
-            }
-            j |= bit;
-            if i < j {
-                re.swap(i, j);
-                im.swap(i, j);
-            }
+        let buf = &mut self.buf[..n];
+        for ((c, r), i) in buf.iter_mut().zip(re.iter()).zip(im.iter()) {
+            *c = rustfft::num_complex::Complex::new(*r, *i);
         }
-        let sign = if inv { -1.0 } else { 1.0 };
-        let mut len = 2;
-        while len <= n {
-            let half = len / 2;
-            let step = self.max_n / len;
-            let mut i = 0;
-            while i < n {
-                for k in 0..half {
-                    let wr = self.tw_re[k * step];
-                    let wi = sign * self.tw_im[k * step];
-                    let (a, b) = (i + k, i + k + half);
-                    let tr = re[b] * wr - im[b] * wi;
-                    let ti = re[b] * wi + im[b] * wr;
-                    re[b] = re[a] - tr;
-                    im[b] = im[a] - ti;
-                    re[a] += tr;
-                    im[a] += ti;
-                }
-                i += len;
-            }
-            len <<= 1;
+        let lg = n.trailing_zeros() as usize;
+        let plan = if inv { &self.inv[lg] } else { &self.fwd[lg] };
+        plan.process_with_scratch(buf, &mut self.scratch);
+        let s = if inv { 1.0 / n as f64 } else { 1.0 };
+        for ((c, r), i) in buf.iter().zip(re.iter_mut()).zip(im.iter_mut()) {
+            *r = c.re * s;
+            *i = c.im * s;
         }
     }
 }
@@ -395,7 +374,7 @@ mod tests {
 
     #[test]
     fn fft_roundtrip_and_tone() {
-        let f = Fft::new(256);
+        let mut f = Fft::new(256);
         let mut re: Vec<f64> = (0..256).map(|i| (2.0 * PI * 8.0 * i as f64 / 256.0).cos()).collect();
         let mut im = vec![0.0; 256];
         let orig = re.clone();
@@ -434,7 +413,7 @@ mod tests {
     /// Frequency of the strongest smoothed-spectrum peak between lo..hi Hz.
     fn env_peak(sig: &[f32], fs: f64, lo: f64, hi: f64) -> f64 {
         let n = 8192;
-        let fft = Fft::new(n);
+        let mut fft = Fft::new(n);
         let mut re = vec![0.0; n];
         let mut im = vec![0.0; n];
         let l = sig.len().min(n);

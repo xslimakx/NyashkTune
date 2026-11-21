@@ -588,8 +588,13 @@ mod tests {
 fn demo_voice(buffer: &mut Buffer) {
     use std::sync::Mutex;
     static ST: Mutex<Option<(bool, u64, f64, f64, f64)>> = Mutex::new(None);
-    let mut g = ST.lock().unwrap();
-    let st = g.get_or_insert_with(|| (std::env::var("NYASHK_DEMO").is_ok(), 0, 0.0, 0.0, 0.0));
+    // lock-free check first: the audio threads of several instances must never wait on each other
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("NYASHK_DEMO").is_ok()) {
+        return;
+    }
+    let Ok(mut g) = ST.try_lock() else { return };
+    let st = g.get_or_insert_with(|| (true, 0, 0.0, 0.0, 0.0));
     if !st.0 {
         return;
     }
