@@ -1533,7 +1533,15 @@ impl Engine {
         let (read_rate, env_s, env_mode) = if hybrid { (r, s_raw / r, FormantMode::Smooth) } else { (1.0, s_raw, mode) };
         let s_cl = if mode == FormantMode::Classic { s_raw.clamp(0.5, 2.0) } else { 1.0 };
 
-        let tc = sy.next_centre;
+        let mut tc = sy.next_centre;
+        // A grain whose left half would start in the past used to be cut off there - the window
+        // then jumped from 0 to ~0.6 in one sample: a click / short squeak. It happened when the
+        // period suddenly grew (a low note starting after a breath or consonant) and only for
+        // some start positions, so a render had it "every other time". Start it a little later
+        // instead; the content pull below takes the few ms back.
+        if tc < (o + hg) as f64 {
+            tc = (o + hg) as f64;
+        }
         if vi == 0 {
             self.dbg_lag = (tc - m as f64) - self.latency as f64;
         }
@@ -1599,7 +1607,11 @@ impl Engine {
         let lag_err = (sy.next_centre - self.latency as f64) - nom;
         sy.content_nom = nom + (self.pull * lag_err).clamp(-0.5 * hs, 0.5 * hs);
         sy.prev_hs = hs;
-        sy.next_decision = sy.next_centre - (1.3 * p.max(hs).max(self.fallback()) + 4.0);
+        // decide early enough for the next grain too: its half-length follows the period at the next
+        // content position (already analysed - it lies a latency behind the input)
+        let (vn, pn) = self.query(sy.content_nom);
+        let pn = if vn { pn } else { self.fallback() };
+        sy.next_decision = sy.next_centre - ((1.3 * p.max(hs).max(self.fallback())).max(1.35 * pn) + 4.0);
         if sy.next_decision < o as f64 - hs {
             sy.next_centre = o as f64 + hs;
             sy.next_decision = o as f64;
@@ -1617,6 +1629,66 @@ mod fuzz_tests {
     /// is corrected) and note onsets where the 2nd harmonic is the strongest partial (formant on
     /// it, fundamental weak) must not be read an octave off - the grains would come out an
     /// octave off too ("jumps an octave for no reason").
+    /// Low notes that start right after a breath / consonant: the first voiced grain is much
+    /// longer than the unvoiced ones before it. It used to be cut off where it would start in the
+    /// past - a click, and only for some start positions (a render had it "every other time").
+    #[test]
+    fn no_clicks_when_a_low_note_starts_after_noise() {
+        let fs = 48000.0;
+        let mut seed = 99u32;
+        let mut x = Vec::new();
+        let (mut ph, mut lp) = (0.0f64, 0.0f32);
+        for (k, f0) in [47.0f64, 52.0, 44.0, 58.0, 49.0, 55.0].iter().enumerate() {
+            // 120 ms of breathy noise, then 500 ms of a low voice (harmonics up to 3 kHz)
+            for _ in 0..(0.12 * fs) as usize {
+                lp += 0.3 * (xorshift(&mut seed) - 0.5 - lp);
+                x.push(lp * 0.15);
+            }
+            let f0 = f0 * (1.0 + 0.002 * k as f64);
+            let nh = (3000.0 / f0) as usize;
+            let n = (0.5 * fs) as usize;
+            for i in 0..n {
+                ph += f0 / fs;
+                let fade = ((i.min(n - i)) as f64 / 480.0).min(1.0);
+                let mut y = 0.0;
+                for h in 1..=nh {
+                    let fh = h as f64 * f0;
+                    let amp = 1.0 / (1.0 + ((fh - 600.0) / 300.0).powi(2)) + 0.2 / h as f64;
+                    y += amp * (2.0 * PI * h as f64 * ph).sin();
+                }
+                x.push((y * 0.05 * fade) as f32);
+            }
+        }
+        let p = Params { min_hz: 40.0, amount: 0.0, ..Params::default() };
+        let count = |out: &[f32]| -> usize {
+            // a click: a 2nd difference far above its 10 ms neighbourhood on a sounding signal
+            let d2: Vec<f32> = out.windows(3).map(|w| w[2] - 2.0 * w[1] + w[0]).collect();
+            let (mut clicks, mut last) = (0, 0usize);
+            for i in 480..d2.len().saturating_sub(480) {
+                let loc = (d2[i - 240..i + 240].iter().map(|v| v * v).sum::<f32>() / 480.0).sqrt() + 1e-7;
+                if d2[i].abs() > 9.0 * loc && d2[i].abs() > 0.004 && i > last + 240 {
+                    clicks += 1;
+                    last = i;
+                }
+            }
+            clicks
+        };
+        assert_eq!(count(&x), 0, "the test signal itself clicks");
+        let mut worst = 0;
+        for off in [0usize, 33, 129, 480, 777, 1000, 2047, 3001] {
+            let mut e = Engine::new(fs, p.min_hz);
+            e.set_params(&p);
+            let mut out = Vec::with_capacity(x.len() + off);
+            for i in 0..x.len() + off {
+                let v = if i < off { 0.0 } else { x[i - off] };
+                out.push(e.process_frame([v, v], 1)[0]);
+            }
+            let clicks = count(&out);
+            worst = worst.max(clicks);
+        }
+        assert!(worst == 0, "{worst} clicks in one render");
+    }
+
     #[test]
     fn no_octave_errors_high_notes_and_weak_fundamental() {
         let fs = 48000.0;
