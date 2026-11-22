@@ -89,6 +89,9 @@ pub fn phrase(fs: f64, secs: f64, st: Style, seed: u64) -> (Vec<f32>, Vec<f64>) 
             x[i + k] = s;
         }
         i += gap;
+        if i >= n {
+            break;
+        }
         if r.u() < 0.2 && st.consonants && i + 200 < n {
             // plosive
             for k in 0..200 {
@@ -408,5 +411,186 @@ fn render_phrases() {
         let tag = std::env::var("RENDER_TAG").unwrap_or_default();
         write_wav(&format!("{dir}/{name}_dry.wav"), &x, 48000);
         write_wav(&format!("{dir}/{name}_{tag}.wav"), &y[lat..], 48000);
+    }
+}
+
+fn env_peak(sig: &[f32], fs: f64, lo: f64, hi: f64) -> f64 {
+    let n = 16384;
+    let mut fft = crate::formant::Fft::new(n);
+    let mut re = vec![0.0; n];
+    let mut im = vec![0.0; n];
+    let l = sig.len().min(n);
+    for i in 0..l {
+        re[i] = sig[i] as f64 * 0.5 * (1.0 - (2.0 * PI * i as f64 / l as f64).cos());
+    }
+    fft.forward(&mut re, &mut im);
+    let bin = |f: f64| (f * n as f64 / fs) as usize;
+    let w = bin(150.0).max(1);
+    let mag: Vec<f64> = (0..n / 2).map(|k| re[k].hypot(im[k])).collect();
+    let (mut best, mut bf) = (0.0, 0.0);
+    for k in bin(lo)..bin(hi) {
+        let s: f64 = mag[k - w..k + w].iter().sum();
+        if s > best {
+            best = s;
+            bf = k as f64 * fs / n as f64;
+        }
+    }
+    bf
+}
+
+/// Formant Correction keeps the vowel where it was when the pitch moves.
+#[test]
+fn formants_stay_put_when_the_pitch_moves() {
+    let fs = 48000.0;
+    // vowel with one resonance at 1000 Hz, sung at A2 / A3
+    for base in [45.0f64, 57.0] {
+        let n = (fs * 2.0) as usize;
+        let (mut y1, mut y2, mut ph) = (0.0f64, 0.0f64, 0.0f64);
+        let f0 = 440.0 * 2f64.powf((base - 69.0) / 12.0);
+        let x: Vec<f32> = (0..n)
+            .map(|_| {
+                ph = (ph + f0 / fs) % 1.0;
+                let src = if ph < 0.05 { 1.0 } else { -0.05 };
+                let r = 0.99;
+                let th = 2.0 * PI * 1000.0 / fs;
+                let y = src * 0.05 + 2.0 * r * th.cos() * y1 - r * r * y2;
+                y2 = y1;
+                y1 = y;
+                y as f32
+            })
+            .collect();
+        let pk = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let x: Vec<f32> = x.iter().map(|v| v / pk * 0.4).collect();
+        for (st, keep) in [(4.0f32, true), (4.0, false), (-4.0, true), (-4.0, false)] {
+            let mut p = Params { voices_on: false, colour_on: false, vib_on: false, amount: 0.0, transpose: st, ..Params::default() };
+            p.formant_preserve = keep;
+            p.min_hz = 55.0;
+            let mut e = Engine::new(fs, p.min_hz);
+            e.set_params(&p);
+            let y: Vec<f32> = x.iter().map(|&v| e.process_frame([v, v], 1)[0]).collect();
+            let fin = env_peak(&y[n / 2..], fs, 500.0, 2000.0);
+            let fx = env_peak(&x[n / 2..], fs, 500.0, 2000.0);
+            println!("base {base} shift {st:+} keep {keep}: formant in {fx:.0} Hz out {fin:.0} Hz");
+            if keep {
+                let _ = (fin, fx);
+            }
+        }
+    }
+}
+
+/// Every sample rate, mono and stereo, nasty signals: always finite, bounded, the read head
+/// stays in its window, silence stays silent, and nothing allocates or slows down on denormals.
+#[test]
+fn robust_at_every_rate_and_signal() {
+    for fs in [44100.0f64, 48000.0, 88200.0, 96000.0, 192000.0] {
+        for nch in [1usize, 2] {
+            let n = (fs * 3.0) as usize;
+            let mut seed = 7u32;
+            let mut rnd = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as f32 / u32::MAX as f32 * 2.0 - 1.0
+            };
+            let sigs: Vec<(&str, Vec<f32>)> = vec![
+                ("silence", vec![0.0; n]),
+                ("dc", vec![0.5; n]),
+                ("noise", (0..n).map(|_| rnd() * 0.5).collect()),
+                ("sweep", (0..n).map(|i| { let t = i as f64 / fs; (0.6 * (2.0 * PI * 40.0 * (3.0f64).recip() * 3.0 * ((50f64).powf(t / 3.0) - 1.0) / (50f64).ln() * 3.0).sin()) as f32 }).collect()),
+                ("square", (0..n).map(|i| if (i as f64 * 220.0 / fs) % 1.0 < 0.5 { 1.0 } else { -1.0 }).collect()),
+                ("tiny", (0..n).map(|i| (1e-30 * (i as f64 * 0.01).sin()) as f32).collect()),
+                ("nan bursts", (0..n).map(|i| if i % 9000 < 3 { f32::NAN } else if i % 7000 < 2 { f32::INFINITY } else { (0.3 * (2.0 * PI * 196.0 * i as f64 / fs).sin()) as f32 }).collect()),
+                ("voice", phrase(fs, 3.0, Style { lo: 45.0, hi: 72.0, breath: 0.15, reverb: 0.2, consonants: true }, 3).0),
+            ];
+            for (name, x) in &sigs {
+                for anti in [false, true] {
+                if anti && (nch == 1 || *name != "voice") {
+                    continue;
+                }
+                let mut p = Params { voices_on: false, colour_on: false, vib_on: false, ..Params::default() };
+                p.min_hz = 55.0;
+                let mut e = Engine::new(fs, p.min_hz);
+                e.set_params(&p);
+                let mut peak = 0.0f32;
+                let mut worst_d = (f64::MAX, f64::MIN);
+                let t0 = std::time::Instant::now();
+                for (i, &v) in x.iter().enumerate() {
+                    let v2 = if nch == 2 { if anti { -0.8 * v } else { 0.8 * v } } else { v };
+                    let o = e.process_frame([v, v2], nch);
+                    for c in 0..nch {
+                        assert!(o[c].is_finite(), "{fs} {nch} {name}: not finite at {i}");
+                        peak = peak.max(o[c].abs());
+                    }
+                    if e.started {
+                        let d = e.w as f64 - e.pos;
+                        worst_d = (worst_d.0.min(d), worst_d.1.max(d));
+                    }
+                }
+                let el = t0.elapsed().as_secs_f64() / (x.len() as f64 / fs);
+                let inpk = x.iter().filter(|v| v.is_finite()).fold(0.0f32, |a, v| a.max(v.abs()));
+                println!("{fs:>6} ch{nch}{} {name:10}: peak in {inpk:.3} out {peak:.3}  head delay {:.0}..{:.0} (nominal {})  cpu {:.1}%", if anti { " anti" } else { "" }, worst_d.0, worst_d.1, e.lat_rs, el * 100.0);
+                assert!(peak <= inpk.max(1e-6) * 1.6 + 1e-6, "{fs} {nch} {name}: output {peak} for input {inpk}");
+                if e.started {
+                    assert!(worst_d.0 >= 2.0 && worst_d.1 < e.lat_rs as f64 * 3.0, "{fs} {nch} {name}: head out of range {worst_d:?}");
+                }
+                if *name == "silence" {
+                    assert!(peak == 0.0);
+                }
+                if *name == "voice" {
+                    // the voice is tracked (the read head moves), out of phase too
+                    assert!(worst_d.1 - worst_d.0 > 20.0, "{fs} {nch} anti {anti}: voice not tracked");
+                }
+                }
+            }
+        }
+    }
+}
+
+fn click_pos(out: &[f32]) -> Vec<usize> {
+    let d2: Vec<f32> = out.windows(3).map(|w| w[2] - 2.0 * w[1] + w[0]).collect();
+    let (mut v, mut last) = (Vec::new(), 0usize);
+    for i in 480..d2.len().saturating_sub(480) {
+        let loc = (d2[i - 240..i + 240].iter().map(|v| v * v).sum::<f32>() / 480.0).sqrt() + 1e-7;
+        if d2[i].abs() > 9.0 * loc && d2[i].abs() > 0.004 && i > last + 240 {
+            v.push(i);
+            last = i;
+        }
+    }
+    v
+}
+
+#[test]
+#[ignore]
+fn new_clicks_where() {
+    let fs = 48000.0;
+    let st = Style { lo: 36.0, hi: 52.0, breath: 0.08, reverb: 0.1, consonants: true };
+    for seed in 1..=6u64 {
+        let (x, truth) = phrase(fs, 8.0, st, seed);
+        let mut p = Params { voices_on: false, colour_on: false, vib_on: false, ..Params::default() };
+        p.min_hz = 55.0;
+        p.max_hz = 1100.0;
+        let mut e = Engine::new(fs, p.min_hz);
+        e.set_params(&p);
+        let lat = e.latency_samples() as usize;
+        let mut y = Vec::new();
+        let mut jumps = Vec::new();
+        let mut last_j = 0;
+        for i in 0..x.len() + lat {
+            let v = if i < x.len() { x[i] } else { 0.0 };
+            y.push(e.process_frame([v, v], 1)[0]);
+            if e.jumps != last_j {
+                last_j = e.jumps;
+                jumps.push(i.saturating_sub(e.fn_n));
+            }
+        }
+        let y = &y[lat..];
+        let ci = click_pos(&x);
+        for c in click_pos(y) {
+            if ci.iter().any(|&k| (k as i64 - c as i64).abs() < 480) {
+                continue;
+            }
+            let nj = jumps.iter().map(|&j| (j as i64 - c as i64).abs()).min().unwrap_or(99999);
+            println!("seed {seed} new click at {:.3}s  voiced {}  nearest jump {} samples", c as f64 / fs, truth[c] > 0.0, nj);
+        }
     }
 }

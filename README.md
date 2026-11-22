@@ -53,7 +53,7 @@ input → high-pass → decimate → McLeod pitch method (NSDF, first clear peak
       → formant stage: short frames of the result, the spectral envelope moved back
 ```
 
-Because a jump is always a whole number of periods, a pitch reading an octave off cannot break the sound (no sub-octave rumble). The latency (≈ 40–50 ms, reported to the host) depends on the lowest note of the range.
+Because a jump is always a whole number of periods, a pitch reading an octave off cannot break the sound (no sub-octave rumble). The latency (reported to the host) depends on the lowest note of the range: ≈ 38 ms for Generic, ≈ 19 ms for Soprano, ≈ 48 ms for Bass.
 
 ---
 

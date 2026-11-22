@@ -101,14 +101,14 @@ fn pill(ui: &mut Ui, rect: Rect, text: &str, on: bool, tip: &str) -> bool {
     let painter = ui.painter();
     let hov = resp.hovered();
     painter.rect_filled(rect, CornerRadius::same(6), if on { WHITE } else if hov { PANEL2 } else { Color32::TRANSPARENT });
-    painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, if on { WHITE } else if hov { DIM } else { LINE }), StrokeKind::Inside);
+    painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0_f32, if on { WHITE } else if hov { DIM } else { LINE }), StrokeKind::Inside);
     painter.text(rect.center(), Align2::CENTER_CENTER, text, mono(11.0), if on { Color32::BLACK } else { WHITE });
     resp.clicked()
 }
 
 fn panel(ui: &Ui, rect: Rect, title: &str) {
     ui.painter().rect_filled(rect, CornerRadius::same(6), PANEL);
-    ui.painter().rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, LINE), StrokeKind::Inside);
+    ui.painter().rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0_f32, LINE), StrokeKind::Inside);
     if !title.is_empty() {
         ui.painter().text(Pos2::new(rect.left() + 12.0, rect.top() + 14.0), Align2::LEFT_CENTER, title, mono(10.0), DIM);
     }
@@ -184,7 +184,7 @@ fn knob<P: Param>(ui: &mut Ui, setter: &ParamSetter, p: &P, label: &str, id: &st
         let n = (((to - from).abs() / sweep) * 120.0).ceil().max(2.0) as usize;
         (0..=n).map(|i| pt(ring, from + (to - from) * i as f32 / n as f32)).collect()
     };
-    let w = if r > 34.0 { 5.0 } else { 4.0 };
+    let w = if r > 34.0 { 5.0_f32 } else { 4.0_f32 };
     painter.add(egui::Shape::line(arc(0.0, 1.0), PathStroke::new(w, LINE)));
     let from = if bipolar { 0.5 } else { 0.0 };
     if (norm - from).abs() > 0.002 {
@@ -194,8 +194,8 @@ fn knob<P: Param>(ui: &mut Ui, setter: &ParamSetter, p: &P, label: &str, id: &st
     painter.circle_filled(c + Vec2::new(0.0, 1.5), body + 1.0, Color32::from_rgb(5, 5, 5));
     painter.circle_filled(c, body, Color32::from_rgb(34, 34, 34));
     painter.circle_filled(c, body * 0.84, Color32::from_rgb(24, 24, 24));
-    painter.circle_stroke(c, body, Stroke::new(1.0, Color32::from_rgb(70, 70, 70)));
-    painter.line_segment([pt(body * 0.30, norm), pt(body * 0.80, norm)], Stroke::new(3.0, WHITE));
+    painter.circle_stroke(c, body, Stroke::new(1.0_f32, Color32::from_rgb(70, 70, 70)));
+    painter.line_segment([pt(body * 0.30, norm), pt(body * 0.80, norm)], Stroke::new(3.0_f32, WHITE));
 
     // value box (click to type) + label
     let val = p.normalized_value_to_string(norm, true);
@@ -226,7 +226,7 @@ fn knob<P: Param>(ui: &mut Ui, setter: &ParamSetter, p: &P, label: &str, id: &st
     } else {
         let vresp = ui.allocate_rect(vr, Sense::click()).on_hover_text("Click to type a value");
         let painter = ui.painter();
-        painter.rect_stroke(vr, CornerRadius::same(4), Stroke::new(1.0, if vresp.hovered() { DIM } else { LINE }), StrokeKind::Inside);
+        painter.rect_stroke(vr, CornerRadius::same(4), Stroke::new(1.0_f32, if vresp.hovered() { DIM } else { LINE }), StrokeKind::Inside);
         let gw = ui.fonts(|f| f.layout_no_wrap(val.clone(), mono(11.0), WHITE).size().x);
         let size = if gw > vr.width() - 6.0 { (11.0 * (vr.width() - 6.0) / gw).max(7.5) } else { 11.0 };
         painter.text(vr.center(), Align2::CENTER_CENTER, &val, mono(size), WHITE);
@@ -249,7 +249,7 @@ fn meter(ui: &Ui, rect: Rect, lin: f32, label: &str) {
     let h = rect.height() * t;
     let col = if db > -0.5 { ILLEGAL } else { Color32::from_gray(200) };
     p.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - h), rect.max), CornerRadius::same(2), col);
-    p.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0, LINE), StrokeKind::Inside);
+    p.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0_f32, LINE), StrokeKind::Inside);
     p.text(Pos2::new(rect.center().x, rect.bottom() + 9.0), Align2::CENTER_CENTER, label, mono(9.0), DIM);
 }
 
@@ -265,12 +265,12 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
             v.window_fill = PANEL;
             v.extreme_bg_color = PANEL;
             v.override_text_color = Some(WHITE);
-            v.window_stroke = Stroke::new(1.0, LINE);
+            v.window_stroke = Stroke::new(1.0_f32, LINE);
             v.selection.bg_fill = Color32::from_rgb(64, 64, 64);
-            v.selection.stroke = Stroke::new(1.0, WHITE);
+            v.selection.stroke = Stroke::new(1.0_f32, WHITE);
             for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
                 w.corner_radius = CornerRadius::same(6);
-                w.bg_stroke = Stroke::new(1.0, LINE);
+                w.bg_stroke = Stroke::new(1.0_f32, LINE);
             }
             v.widgets.inactive.weak_bg_fill = PANEL;
             v.widgets.inactive.bg_fill = PANEL;
@@ -278,7 +278,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
             v.widgets.hovered.bg_fill = PANEL2;
             v.widgets.active.weak_bg_fill = PANEL2;
             v.widgets.open.weak_bg_fill = PANEL2;
-            v.widgets.hovered.bg_stroke = Stroke::new(1.0, DIM);
+            v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, DIM);
             v.popup_shadow = egui::Shadow::NONE;
             v.window_shadow = egui::Shadow::NONE;
             ctx.set_visuals(v);
@@ -339,7 +339,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 painter.text(at(18.0, 32.0), Align2::LEFT_CENTER, "Nyashk", mono(19.0), WHITE);
                 painter.text(at(18.0 + 6.0 * 11.4, 32.0), Align2::LEFT_CENTER, "Tune", mono(19.0), DIM);
                 painter.text(at(28.0 + 10.0 * 11.4 + 6.0, 34.0), Align2::LEFT_CENTER, "REAL-TIME PITCH CORRECTION", mono(10.5), DIM);
-                painter.hline(o.x + 14.0..=o.x + BASE_W - 14.0, o.y + 56.0, Stroke::new(1.0, LINE));
+                painter.hline(o.x + 14.0..=o.x + BASE_W - 14.0, o.y + 56.0, Stroke::new(1.0_f32, LINE));
                 let byp = p.bypass.value();
                 if pill(ui, rect(BASE_W - 14.0 - 84.0, 20.0, 84.0, 24.0), "BYPASS", byp, "Bypass the plugin.") {
                     set_b(setter, &p.bypass, !byp);
@@ -380,16 +380,16 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 let ang = |cents: f32| -> f32 { std::f32::consts::PI * (1.0 + (cents.clamp(-100.0, 100.0) + 100.0) / 200.0) };
                 let pt = |cents: f32, r: f32| c + Vec2::new(ang(cents).cos() * r, ang(cents).sin() * r);
                 let arc: Vec<Pos2> = (0..=80).map(|i| pt(-100.0 + 200.0 * i as f32 / 80.0, rad)).collect();
-                painter.add(egui::Shape::line(arc, PathStroke::new(6.0, Color32::from_rgb(24, 24, 24))));
+                painter.add(egui::Shape::line(arc, PathStroke::new(6.0_f32, Color32::from_rgb(24, 24, 24))));
                 for t in [-100.0f32, -50.0, 0.0, 50.0, 100.0] {
-                    painter.line_segment([pt(t, rad - 10.0), pt(t, rad + 4.0)], Stroke::new(1.0, if t == 0.0 { WHITE } else { DIM }));
+                    painter.line_segment([pt(t, rad - 10.0), pt(t, rad + 4.0)], Stroke::new(1.0_f32, if t == 0.0 { WHITE } else { DIM }));
                     painter.text(pt(t, rad + 16.0), Align2::CENTER_CENTER, if t == 0.0 { "0".to_string() } else { format!("{:+.0}", t) }, mono(9.0), DIM);
                 }
                 let cc = st.corr * 100.0;
                 if showing && cc.abs() > 0.5 {
                     let n = ((cc.abs() / 200.0) * 80.0).ceil().max(2.0) as usize;
                     let bar: Vec<Pos2> = (0..=n).map(|i| pt(cc * i as f32 / n as f32, rad)).collect();
-                    painter.add(egui::Shape::line(bar, PathStroke::new(6.0, WHITE)));
+                    painter.add(egui::Shape::line(bar, PathStroke::new(6.0_f32, WHITE)));
                 }
                 painter.text(Pos2::new(m.left() + 12.0, m.top() + 14.0), Align2::LEFT_CENTER, "CORRECTION (cents)", mono(10.0), DIM);
                 let tgt = if showing && st.hold_note > 0.0 { note_name(st.hold_note as i32) } else { "--".to_string() };
@@ -494,7 +494,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                         NoteState::Bypass => (Color32::from_gray(if hov { 22 } else { 14 }), BYPASS.gamma_multiply(0.7), BYPASS, "B"),
                     };
                     painter.rect_filled(r, CornerRadius::same(5), fill);
-                    painter.rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0, stroke), StrokeKind::Inside);
+                    painter.rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0_f32, stroke), StrokeKind::Inside);
                     if mark.is_empty() {
                         painter.text(r.center(), Align2::CENTER_CENTER, nn(pc), mono(10.5), txt);
                     } else {
@@ -503,7 +503,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     }
                     if st_n == NoteState::Illegal {
                         // a thin line through the name: "not used"
-                        painter.hline(r.center().x - 9.0..=r.center().x + 9.0, r.center().y, Stroke::new(1.0, Color32::from_gray(80)));
+                        painter.hline(r.center().x - 9.0..=r.center().x + 9.0, r.center().y, Stroke::new(1.0_f32, Color32::from_gray(80)));
                     }
                     if resp.clicked() {
                         cycle(setter, pc, st_n);
@@ -608,7 +608,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                     let hr = Rect::from_center_size(Pos2::new(x, keys.center().y), Vec2::new(12.0, keys.height() + 6.0));
                     let resp = ui.interact(hr, egui::Id::new(("range", which)), Sense::drag()).on_hover_text("Drag: correction range (notes outside it are left as sung).");
                     let col = if resp.hovered() || resp.dragged() { WHITE } else { IN_COL };
-                    painter.line_segment([Pos2::new(x, keys.top() - 2.0), Pos2::new(x, keys.bottom() + 2.0)], Stroke::new(2.0, col));
+                    painter.line_segment([Pos2::new(x, keys.top() - 2.0), Pos2::new(x, keys.bottom() + 2.0)], Stroke::new(2.0_f32, col));
                     // a small grab tab
                     let tab = Rect::from_center_size(Pos2::new(x, keys.top() - 2.0), Vec2::new(8.0, 5.0));
                     painter.rect_filled(tab, CornerRadius::same(2), col);
@@ -691,7 +691,7 @@ pub fn create(params: Arc<NyashkTuneParams>, meters: Arc<Meters>) -> Option<Box<
                 }
                 let gc = if r.hovered() || r.dragged() { WHITE } else { DIM };
                 for k in [5.0f32, 9.0, 13.0] {
-                    painter.line_segment([Pos2::new(full.max.x - 3.0, full.max.y - k), Pos2::new(full.max.x - k, full.max.y - 3.0)], Stroke::new(1.0, gc));
+                    painter.line_segment([Pos2::new(full.max.x - 3.0, full.max.y - k), Pos2::new(full.max.x - k, full.max.y - 3.0)], Stroke::new(1.0_f32, gc));
                 }
             });
         },

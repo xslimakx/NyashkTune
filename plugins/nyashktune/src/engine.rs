@@ -312,6 +312,9 @@ pub struct Engine {
     ring_mask: i64,
     ring: [Vec<f32>; MAX_CH],
     mono: Vec<f32>,
+    e_mid: f32,
+    e_side: f32,
+    use_side: bool,
     w: i64, // number of input samples written
 
     // analysis (McLeod pitch method on a 16 kHz copy)
@@ -345,6 +348,8 @@ pub struct Engine {
     xf_pow: bool,
     ctl_cnt: usize,
     cur_voiced: bool,
+    cur_voiced_hold: bool,
+    unv_ctl: u32,
     cur_period: f64,
 
     // formant stage: short-time frames of the shifted signal, envelope moved back
@@ -421,7 +426,7 @@ impl Engine {
         let decim = ((fs / 16000.0).round() as usize).max(1);
         let fs_dec = fs / decim as f64;
         let mut fn_n = 256usize;
-        while (fn_n as f64) < 0.021 * fs {
+        while (fn_n as f64) < 0.0105 * fs {
             fn_n <<= 1;
         }
         let fwin: Vec<f32> = (0..fn_n).map(|i| (0.5 - 0.5 * (2.0 * PI * i as f64 / fn_n as f64).cos()) as f32).collect();
@@ -442,6 +447,9 @@ impl Engine {
             ring_mask: ring_size as i64 - 1,
             ring: [vec![0.0; ring_size], vec![0.0; ring_size]],
             mono: vec![0.0; ring_size],
+            e_mid: 0.0,
+            e_side: 0.0,
+            use_side: false,
             w: 0,
             hp: Biquad::default(),
             hp_fc: 0.0,
@@ -470,6 +478,8 @@ impl Engine {
             xf_pow: false,
             ctl_cnt: 0,
             cur_voiced: false,
+            cur_voiced_hold: false,
+            unv_ctl: 0,
             cur_period: fs / 150.0,
             fbuf: [vec![0.0; fn_n], vec![0.0; fn_n]],
             fw: 0,
@@ -549,6 +559,9 @@ impl Engine {
         self.fw = 0;
         self.fcnt = 0;
         self.mono.iter_mut().for_each(|v| *v = 0.0);
+        self.e_mid = 0.0;
+        self.e_side = 0.0;
+        self.use_side = false;
         self.dec.iter_mut().for_each(|v| *v = 0.0);
         self.w = 0;
         self.dec_w = 0;
@@ -567,6 +580,8 @@ impl Engine {
         self.xf_left = 0;
         self.ctl_cnt = 0;
         self.cur_voiced = false;
+        self.cur_voiced_hold = false;
+        self.unv_ctl = 0;
         self.cur_period = self.fallback();
         for a in self.air.iter_mut() {
             a.z1 = 0.0;
@@ -633,6 +648,24 @@ impl Engine {
             m += x;
         }
         m /= nch as f32;
+        // a stereo vocal recorded (or widened) out of phase cancels in the sum: then analyse the
+        // difference of the channels instead
+        if nch == 2 {
+            let sd = 0.5 * (self.ring[0][(self.w & self.ring_mask) as usize] - self.ring[1][(self.w & self.ring_mask) as usize]);
+            let k = 1.0 / (0.05 * self.fs) as f32;
+            self.e_mid += (m * m - self.e_mid) * k;
+            self.e_side += (sd * sd - self.e_side) * k;
+            if self.use_side {
+                if self.e_mid > 0.5 * self.e_side {
+                    self.use_side = false;
+                }
+            } else if self.e_side > 8.0 * self.e_mid + 1e-12 {
+                self.use_side = true;
+            }
+            if self.use_side {
+                m = sd;
+            }
+        }
         self.mono[(self.w & self.ring_mask) as usize] = m;
 
         // analysis path: high-pass then decimate
@@ -772,10 +805,22 @@ impl Engine {
         let (voiced, pq) = self.query(self.pos);
         let p = if voiced { pq } else { self.fallback() };
         let dt = CTL as f64 / self.fs;
-        let r = self.compute_ratio(dt, voiced, p);
-        self.rate_target = r.clamp(0.25, 4.0);
+        // a dropout of the pitch reading inside a sung note (a few ms of breath noise, a missed
+        // frame) keeps the correction: letting go for 10-20 ms is an audible blip of the raw pitch
+        if voiced {
+            self.unv_ctl = 0;
+        } else {
+            self.unv_ctl += 1;
+        }
+        let holding = !voiced && self.cur_voiced_hold && (self.unv_ctl as f64 * dt) < 0.025;
+        if !holding {
+            let r = self.compute_ratio(dt, voiced, p);
+            self.rate_target = r.clamp(0.25, 4.0);
+            self.cur_voiced_hold = voiced;
+            self.cur_period = p;
+        }
+        let (voiced, p) = if holding { (true, self.cur_period) } else { (voiced, p) };
         self.cur_voiced = voiced;
-        self.cur_period = p;
         if self.xf_left > 0 {
             return;
         }
