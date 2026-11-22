@@ -1,19 +1,17 @@
 //! NyashkTune DSP core (no plugin-framework dependency).
 //!
-//! Pipeline
+//! Pipeline (the classic real-time tuner: pitch-synchronous resampling)
 //! --------
-//! input -> high-pass -> decimate -> YIN (with continuity) -> pitch *frames* (every ~4 ms)
-//!       -> pitch-mark tracker (waveform-correlation aligned marks, one per period)
-//!       -> grain synthesiser (PSOLA): for every output grain we
-//!            1. pick the analysis mark that continues the previous one,
-//!            2. look up the pitch *at that moment of the audio* (centred median of frames),
-//!            3. decide target note / retune smoothing -> pitch ratio,
-//!            4. overlap-add a Hann grain centred on the mark at the new spacing.
-//! Because the audio is delayed by `latency` samples, step 2 can use pitch measurements from
-//! both before and after the grain -> much steadier decisions than a purely causal tracker.
-//! Formants stay put because every grain keeps its own spectral envelope.
+//! input -> high-pass -> decimate -> McLeod pitch method (NSDF, first clear peak) -> pitch frames
+//!       -> note logic (Speed, Note Transition, Tolerance, vibrato) -> pitch ratio
+//!       -> a read head runs through the delayed input at the ratio; when it drifts too far from
+//!          its nominal delay it jumps by whole pitch periods (at the best-matching offset, with a
+//!          cross-fade), so whole cycles are repeated or skipped and the waveform stays intact
+//!       -> formant stage: short frames of the result, the spectral envelope moved back.
+//! Because the read head lags the input, the pitch at the audio being played is known from
+//! frames before and after it.
 
-use crate::formant::{FormantMode, FormantShifter};
+use crate::formant::{Fft, FormantMode, FormantShifter};
 use std::f64::consts::PI;
 
 // ------------------------------------------------------------------------------------------
@@ -216,26 +214,17 @@ impl Default for Params {
 // ------------------------------------------------------------------------------------------
 
 pub const MAX_CH: usize = 2;
-const YIN_W: usize = 320; // integration window on the decimated signal
-const YIN_HOP: usize = 64; // decimated samples between pitch frames (~4 ms)
+/// decimated samples between pitch frames (~4 ms)
+const HOP: usize = 64;
 const FRAME_RING: usize = 1024;
-/// Fixed-point scale of the pitch-search copy (2^24: -144 dB resolution, no overflow up to +12 dBFS).
-const YQ_SCALE: f32 = 16_777_216.0;
-const MARK_RING: usize = 1024;
+/// control rate of the pitch logic, samples
+const CTL: usize = 32;
 
 #[derive(Clone, Copy, Default)]
 struct Frame {
-    time: i64,   // input sample index at which the frame was computed
+    time: i64,   // input sample index of the centre of the analysed window
     period: f32, // in input samples
     voiced: bool,
-}
-
-#[derive(Clone, Copy, Default)]
-struct Synth {
-    next_centre: f64,
-    next_decision: f64,
-    content_nom: f64,
-    prev_hs: f64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -306,55 +295,66 @@ pub struct Engine {
     states: [u8; 12],
     pub held: [bool; 128],
     pub meters: Meters,
-    pub dbg_lag: f64,
-    pub pull: f64,
-    pub debug: bool,
+    /// number of resampler jumps so far (diagnostics)
+    pub jumps: u64,
 
     fs: f64,
     fs_dec: f64,
     decim: usize,
-    latency: i64,
+    /// delay of the read head (the pitch shifter) behind the input, nominal
+    lat_rs: i64,
+    /// longest period searched for (input samples)
+    max_period: f64,
+    /// the formant stage: frame length, hop
+    fn_n: usize,
+    fn_hop: usize,
 
     ring_mask: i64,
     ring: [Vec<f32>; MAX_CH],
     mono: Vec<f32>,
-    ola: [Vec<f32>; MAX_CH],
     w: i64, // number of input samples written
 
-    // analysis
+    // analysis (McLeod pitch method on a 16 kHz copy)
     hp: Biquad,
     hp_fc: f64,
     dec: Vec<f32>,
     dec_w: i64,
     dec_acc: f64,
     dec_cnt: usize,
-    since_yin: usize,
-    yin_buf: Vec<f32>,
-    yin_d: Vec<f32>,
-    /// Quantised copy of the decimated signal and the YIN difference sums kept up to date sample by
-    /// sample (exact integer arithmetic, so adding and removing terms never drifts). The pitch
-    /// search then only reads them, instead of doing ~130 k multiply-adds in a single sample every
-    /// 4 ms - that burst made some audio blocks several times heavier than the rest.
-    yq: Vec<i32>,
-    ysum: Vec<i64>,
-    ytau: usize,
-    prev_tau: f32,
+    since_hop: usize,
+    pfft: Fft,
+    pre: Vec<f64>,
+    pim: Vec<f64>,
+    nsdf: Vec<f64>,
+    prev_tau: f64,
+    hold_run: u32,
     unvoiced_run: u32,
     frames: Vec<Frame>,
     nframes: u64,
     last_period: f64,
 
-    // pitch marks
-    marks: Vec<i64>,
-    nmarks: u64,
-
-    // synthesis: voice 0 is the corrected lead, 1.. are the extra voices
+    // the pitch shifter: a read head moving at the pitch ratio; it jumps by whole periods
+    // (cross-faded, at the best-matching offset) to stay near its nominal delay
     started: bool,
-    syn: [Synth; NUM_VOICES + 1],
-    vact: [bool; NUM_VOICES + 1],
-    vcomp: f32,                // smoothed output level compensation while voices are on
-    vdelta: [f64; NUM_VOICES], // smoothed interval (semitones) of the extra voices
-    cur_r: f64,                // pitch ratio chosen for the lead's latest grain
+    pos: f64,
+    rate: f64,
+    rate_target: f64,
+    xf_pos: f64,
+    xf_left: usize,
+    xf_len: usize,
+    xf_pow: bool,
+    ctl_cnt: usize,
+    cur_voiced: bool,
+    cur_period: f64,
+
+    // formant stage: short-time frames of the shifted signal, envelope moved back
+    fbuf: [Vec<f32>; MAX_CH],
+    fw: usize,
+    fola: [Vec<f32>; MAX_CH],
+    fr_ring: Vec<f32>,
+    fper_ring: Vec<f32>,
+    fwin: Vec<f32>,
+    fcnt: usize,
     shifter: FormantShifter,
     gbuf: [Vec<f32>; MAX_CH],
 
@@ -379,7 +379,7 @@ pub struct Engine {
     far_note: i32, // the voice is clearly nearer to another note (see pick_note)
     far_age: f64,
     note_sm: f64,
-    c_prev: f64,  // centre at the previous grain (for its slope)
+    c_prev: f64,  // centre at the previous step (for its slope)
     c_slope: f64, // how fast the note centre moves, semitones / s (smoothed)
     n_prev: f64,
     n_slope: f64, // the same for the lightly smoothed pitch
@@ -398,7 +398,7 @@ pub struct Engine {
     tp_min: (f64, f64), // last trough
     tp_max_prev: (f64, f64), // the peak / trough before those: a vibrato repeats itself
     tp_min_prev: (f64, f64),
-    clock: f64,     // lightly smoothed pitch used only to *choose* the note (not to correct it)
+    clock: f64,
 }
 
 #[inline]
@@ -406,32 +406,42 @@ fn rd(r: &[f32], mask: i64, k: i64) -> f32 {
     r[(k & mask) as usize]
 }
 
+/// Window length of the pitch analysis for a lowest frequency (decimated samples).
+fn mpm_window(fs_dec: f64, min_hz: f64) -> usize {
+    (((fs_dec / min_hz.max(40.0)) * 2.0).ceil() as usize + 4).clamp(256, 1000)
+}
+
 impl Engine {
     pub fn new(sample_rate: f64, lowest_hz: f32) -> Self {
         let fs = sample_rate;
-        let max_latency = (2.4 * fs / 40.0).ceil() as usize;
         let mut ring_size = 1usize;
-        while ring_size < max_latency * 4 + 8192 {
+        while ring_size < (fs * 0.5) as usize + 16384 {
             ring_size <<= 1;
         }
         let decim = ((fs / 16000.0).round() as usize).max(1);
+        let fs_dec = fs / decim as f64;
+        let mut fn_n = 256usize;
+        while (fn_n as f64) < 0.021 * fs {
+            fn_n <<= 1;
+        }
+        let fwin: Vec<f32> = (0..fn_n).map(|i| (0.5 - 0.5 * (2.0 * PI * i as f64 / fn_n as f64).cos()) as f32).collect();
         let mut e = Self {
             p: Params::default(),
             allowed_pc: 0xFFF,
             states: [1; 12],
             held: [false; 128],
             meters: Meters { voiced: false, hz: 0.0, target: 0.0, corr: 0.0, centre: 0.0 },
-            dbg_lag: 0.0,
-            pull: 0.6,
-            debug: false,
+            jumps: 0,
             fs,
-            fs_dec: fs / decim as f64,
+            fs_dec,
             decim,
-            latency: 1024,
+            lat_rs: 1024,
+            max_period: fs / 80.0,
+            fn_n,
+            fn_hop: fn_n / 4,
             ring_mask: ring_size as i64 - 1,
             ring: [vec![0.0; ring_size], vec![0.0; ring_size]],
             mono: vec![0.0; ring_size],
-            ola: [vec![0.0; ring_size], vec![0.0; ring_size]],
             w: 0,
             hp: Biquad::default(),
             hp_fc: 0.0,
@@ -439,27 +449,37 @@ impl Engine {
             dec_w: 0,
             dec_acc: 0.0,
             dec_cnt: 0,
-            since_yin: 0,
-            yin_buf: Vec::with_capacity(2048),
-            yin_d: Vec::with_capacity(2048),
-            yq: vec![0; 8192],
-            ysum: vec![0; 640],
-            ytau: 0,
+            since_hop: 0,
+            pfft: Fft::new(2048),
+            pre: vec![0.0; 2048],
+            pim: vec![0.0; 2048],
+            nsdf: vec![0.0; 1024],
             prev_tau: 0.0,
+            hold_run: 0,
             unvoiced_run: 100,
             frames: vec![Frame::default(); FRAME_RING],
             nframes: 0,
             last_period: fs / 150.0,
-            marks: vec![0; MARK_RING],
-            nmarks: 0,
             started: false,
-            syn: [Synth::default(); NUM_VOICES + 1],
-            vact: [false; NUM_VOICES + 1],
-            vdelta: [0.0; NUM_VOICES],
-            vcomp: 1.0,
-            cur_r: 1.0,
-            shifter: FormantShifter::new(((8.0 * fs / 40.0).ceil() as usize + 64).next_power_of_two()),
-            gbuf: [vec![0.0; (4.0 * fs / 40.0).ceil() as usize + 64], vec![0.0; (4.0 * fs / 40.0).ceil() as usize + 64]],
+            pos: 0.0,
+            rate: 1.0,
+            rate_target: 1.0,
+            xf_pos: 0.0,
+            xf_left: 0,
+            xf_len: 1,
+            xf_pow: false,
+            ctl_cnt: 0,
+            cur_voiced: false,
+            cur_period: fs / 150.0,
+            fbuf: [vec![0.0; fn_n], vec![0.0; fn_n]],
+            fw: 0,
+            fola: [vec![0.0; fn_n * 2], vec![0.0; fn_n * 2]],
+            fr_ring: vec![1.0; fn_n],
+            fper_ring: vec![(fs / 150.0) as f32; fn_n],
+            fwin,
+            fcnt: 0,
+            shifter: FormantShifter::new(fn_n * 4),
+            gbuf: [vec![0.0; fn_n], vec![0.0; fn_n]],
             air: [Biquad::default(); MAX_CH],
             air_cache: f32::NAN,
             rng: 0x1234_5678,
@@ -503,44 +523,51 @@ impl Engine {
         e
     }
 
-    /// Lowest pitch to track; decides the latency (about 2.2 periods). Allocation-free.
+    /// Lowest pitch to track; decides the latency. Allocation-free.
     pub fn set_lowest_hz(&mut self, hz: f32) {
         let hz = hz.clamp(40.0, 400.0) as f64;
-        self.latency = (2.2 * self.fs / hz).ceil() as i64;
+        self.max_period = self.fs / hz;
+        // the read head swings up to a period either side of its nominal delay, and a jump plus
+        // its cross-fade must never reach the newest input sample
+        self.lat_rs = (1.45 * self.max_period).ceil() as i64 + 32;
         self.hp_fc = (hz * 0.6).max(25.0);
         self.reset();
     }
 
+    /// Total latency: the pitch shifter plus the formant stage.
     pub fn latency_samples(&self) -> u32 {
-        self.latency as u32
+        (self.lat_rs as usize + self.fn_n) as u32
     }
 
     pub fn reset(&mut self) {
         for c in 0..MAX_CH {
             self.ring[c].iter_mut().for_each(|v| *v = 0.0);
-            self.ola[c].iter_mut().for_each(|v| *v = 0.0);
+            self.fbuf[c].iter_mut().for_each(|v| *v = 0.0);
+            self.fola[c].iter_mut().for_each(|v| *v = 0.0);
         }
+        self.fr_ring.iter_mut().for_each(|v| *v = 1.0);
+        self.fw = 0;
+        self.fcnt = 0;
         self.mono.iter_mut().for_each(|v| *v = 0.0);
         self.dec.iter_mut().for_each(|v| *v = 0.0);
         self.w = 0;
         self.dec_w = 0;
-        self.yq.iter_mut().for_each(|v| *v = 0);
-        self.ytau = 0;
         self.dec_acc = 0.0;
         self.dec_cnt = 0;
-        self.since_yin = 0;
+        self.since_hop = 0;
         self.hp = Biquad::highpass(self.fs, self.hp_fc);
         self.prev_tau = 0.0;
         self.unvoiced_run = 100;
         self.nframes = 0;
-        self.nmarks = 0;
         self.last_period = self.fs / 150.0;
         self.started = false;
-        self.syn = [Synth { prev_hs: self.fs / 150.0, ..Synth::default() }; NUM_VOICES + 1];
-        self.vact = [false; NUM_VOICES + 1];
-        self.vdelta = [0.0; NUM_VOICES];
-        self.vcomp = 1.0;
-        self.cur_r = 1.0;
+        self.pos = 0.0;
+        self.rate = 1.0;
+        self.rate_target = 1.0;
+        self.xf_left = 0;
+        self.ctl_cnt = 0;
+        self.cur_voiced = false;
+        self.cur_period = self.fallback();
         for a in self.air.iter_mut() {
             a.z1 = 0.0;
             a.z2 = 0.0;
@@ -614,276 +641,405 @@ impl Engine {
         self.dec_cnt += 1;
         if self.dec_cnt == self.decim {
             self.dec[(self.dec_w & 4095) as usize] = (self.dec_acc / self.decim as f64) as f32;
-            self.yin_push();
             self.dec_w += 1;
             self.dec_acc = 0.0;
             self.dec_cnt = 0;
-            self.since_yin += 1;
-            if self.since_yin >= YIN_HOP {
-                self.since_yin = 0;
-                self.run_yin();
+            self.since_hop += 1;
+            if self.since_hop >= HOP {
+                self.since_hop = 0;
+                self.run_mpm();
             }
         }
         self.w += 1;
-        let o = self.w - 1; // output time index == current input sample
 
-        if self.w & 15 == 0 {
-            self.advance_marks();
-        }
-
-        if !self.started && self.w > 32 {
+        // ---- the pitch shifter
+        if !self.started && self.w > self.lat_rs + 8 {
             self.started = true;
-            let nc = o as f64 + self.fallback();
-            let s0 = Synth { next_centre: nc, next_decision: o as f64, content_nom: nc - self.latency as f64, prev_hs: self.fallback() };
-            self.syn = [s0; NUM_VOICES + 1];
-            self.nmarks = 0; // resync marks to the stream
-            self.advance_marks();
+            self.pos = (self.w - 1 - self.lat_rs) as f64;
+            self.rate = 1.0;
+            self.rate_target = 1.0;
+            self.ctl_cnt = 0;
         }
-        if self.started && o as f64 >= self.syn[0].next_decision {
-            self.place_grain(0, o, nch);
-        }
+        let mut wet = [0.0f32; MAX_CH];
+        let mut ratio_now = 1.0f64;
         if self.started {
-            for v in 1..=NUM_VOICES {
-                if self.p.voices_on && self.p.voices[v - 1].on && !self.p.bypass {
-                    if !self.vact[v] {
-                        // join in step with the lead
-                        self.syn[v] = self.syn[0];
-                        self.vact[v] = true;
-                    }
-                    if o as f64 >= self.syn[v].next_decision {
-                        self.place_grain(v, o, nch);
-                    }
-                } else {
-                    self.vact[v] = false;
+            if self.ctl_cnt == 0 {
+                self.control();
+            }
+            self.ctl_cnt = (self.ctl_cnt + 1) % CTL;
+            // the ratio glides per sample (no zipper steps)
+            self.rate += (self.rate_target - self.rate) * (1.0 - (-1.0 / (0.0015 * self.fs)).exp());
+            ratio_now = self.rate;
+            for c in 0..nch {
+                wet[c] = self.read_cubic(c, self.pos);
+            }
+            if self.xf_left > 0 {
+                let t = 1.0 - self.xf_left as f64 / self.xf_len as f64;
+                let (gi, go) = if self.xf_pow { ((0.5 * PI * t).sin(), (0.5 * PI * t).cos()) } else { (0.5 - 0.5 * (PI * t).cos(), 0.5 + 0.5 * (PI * t).cos()) };
+                for c in 0..nch {
+                    let old = self.read_cubic(c, self.xf_pos);
+                    wet[c] = wet[c] * gi as f32 + old * go as f32;
                 }
+                self.xf_pos += self.rate;
+                self.xf_left -= 1;
+            }
+            self.pos += self.rate;
+            // never read past the newest sample (only on absurd settings)
+            let newest = (self.w - 3) as f64;
+            if self.pos > newest {
+                self.pos = newest - self.max_period;
             }
         }
 
-        // output
+        // ---- formant stage (constant latency: always framed, processed only when wanted)
+        let n = self.fn_n;
+        let fi = self.fw % n;
+        for c in 0..MAX_CH {
+            self.fbuf[c][fi] = if c < nch { wet[c] } else { 0.0 };
+        }
+        self.fr_ring[fi] = ratio_now as f32;
+        self.fper_ring[fi] = self.cur_period as f32;
+        self.fw += 1;
+        self.fcnt += 1;
+        if self.fcnt >= self.fn_hop {
+            self.fcnt = 0;
+            self.formant_frame(nch);
+        }
+        let oi = self.fw % (2 * n);
+        let mut outw = [0.0f32; MAX_CH];
+        for c in 0..nch {
+            outw[c] = self.fola[c][oi];
+            self.fola[c][oi] = 0.0;
+        }
+
+        // ---- output
         let mut out = [0.0f32; MAX_CH];
-        let oi = (o & self.ring_mask) as usize;
         let drive = if self.p.colour_on { self.p.drive.clamp(0.0, 1.0) } else { 0.0 };
         let air_on = self.p.colour_on && self.p.air_db.abs() > 0.05;
-        // Voices add to the lead: keep the sum from running away (power sum, only when it would
-        // be well above unity), then a soft knee as a last safety so nothing hard-clips.
-        let mut pw = 1.0f32;
-        let mut any_v = false;
-        for v in 0..NUM_VOICES {
-            if self.p.voices_on && self.p.voices[v].on && !self.p.bypass {
-                let lv = 10f32.powf(self.p.voices[v].level_db / 20.0);
-                pw += lv * lv;
-                any_v = true;
-            }
-        }
-        let comp_t = if any_v { (1.25 / pw.sqrt()).min(1.0) } else { 1.0 };
-        self.vcomp += (comp_t - self.vcomp) * (1.0 / (0.03 * self.fs as f32)).min(1.0);
+        let lat = self.latency_samples() as i64;
+        let o = self.w - 1;
         for c in 0..nch {
-            let mut wet = self.ola[c][oi];
-            self.ola[c][oi] = 0.0;
-            if any_v || self.vcomp != 1.0 {
-                wet *= self.vcomp;
-                let a = wet.abs();
-                if a > 0.85 {
-                    wet = wet.signum() * (0.85 + 0.15 * ((a - 0.85) / 0.15).tanh());
-                }
-            }
+            let mut y = outw[c];
             if air_on {
-                wet = self.air[c].tick(wet as f64) as f32;
+                y = self.air[c].tick(y as f64) as f32;
             }
             if drive > 0.0 {
                 let g = 1.0 + 3.0 * drive;
-                wet = (wet * g).tanh() / g.sqrt();
+                y = (y * g).tanh() / g.sqrt();
             }
-            let dry = rd(&self.ring[c], self.ring_mask, o - self.latency);
-            let y = if self.p.bypass { dry } else { dry * (1.0 - mix) + wet * mix };
-            out[c] = y * out_gain;
+            let dry = rd(&self.ring[c], self.ring_mask, o - lat);
+            let v = if self.p.bypass { dry } else { dry * (1.0 - mix) + y * mix };
+            out[c] = v * out_gain;
         }
         out
     }
 
+    /// One short-time frame of the shifted signal: the formants the resampling moved by the
+    /// pitch ratio are moved back (Formant Corrected), then overlap-added.
+    fn formant_frame(&mut self, nch: usize) {
+        let n = self.fn_n;
+        let start = self.fw; // fbuf holds the last n samples, oldest at fw % n
+        let centre = (start + n / 2) % n;
+        let r = self.fr_ring[centre] as f64;
+        let per = self.fper_ring[centre] as f64;
+        let s = 1.0 / r;
+        let want = self.p.formant_on && self.p.formant_preserve && s.ln().abs() > 0.001;
+        for c in 0..nch {
+            for j in 0..n {
+                self.gbuf[c][j] = self.fbuf[c][(start + j) % n] * self.fwin[j];
+            }
+        }
+        if want {
+            let (g0, g1) = self.gbuf.split_at_mut(1);
+            let right = if nch == 2 { Some(&mut g1[0][..n]) } else { None };
+            let ok = self.shifter.process2(&mut g0[0][..n], right, (per / r).max(16.0), self.fs, FormantMode::Smooth, s.clamp(0.4, 2.5), 0.0);
+            let _ = ok;
+        }
+        // hop n/4 with a Hann window: the windows sum to 2
+        let base = self.fw;
+        for c in 0..nch {
+            for j in 0..n {
+                let idx = (base + j) % (2 * n);
+                self.fola[c][idx] += 0.5 * self.gbuf[c][j];
+            }
+        }
+    }
+
     // --------------------------------------------------------------------------------------
-    // YIN pitch frames
+    // Pitch shifter control
     // --------------------------------------------------------------------------------------
-    /// Slide the difference sums by the newest decimated sample (written at `dec_w`).
-    #[inline]
-    fn yin_push(&mut self) {
-        let n = self.dec_w;
-        let v = self.dec[(n & 4095) as usize];
-        let q = (v.clamp(-4.0, 4.0) * YQ_SCALE) as i32;
-        // mirrored ring (every sample stored twice) so the lags below are one contiguous slice
-        let i = (n & 4095) as usize;
-        self.yq[i] = q;
-        self.yq[i + 4096] = q;
-        let t = self.ytau;
-        if t == 0 {
+    fn control(&mut self) {
+        let (voiced, pq) = self.query(self.pos);
+        let p = if voiced { pq } else { self.fallback() };
+        let dt = CTL as f64 / self.fs;
+        let r = self.compute_ratio(dt, voiced, p);
+        self.rate_target = r.clamp(0.25, 4.0);
+        self.cur_voiced = voiced;
+        self.cur_period = p;
+        if self.xf_left > 0 {
             return;
         }
-        let (base, bw) = (i + 4096, ((n - YIN_W as i64) & 4095) as usize + 4096);
-        let q_old = self.yq[bw] as i64;
-        let (r1, r2) = (&self.yq[base - t..base], &self.yq[bw - t..bw]);
-        // r1[t - tau] is the sample `tau` before the newest one
-        for ((d, &x1), &x2) in self.ysum[1..=t].iter_mut().zip(r1.iter().rev()).zip(r2.iter().rev()) {
-            let a = q as i64 - x1 as i64;
-            let b = q_old - x2 as i64;
-            *d += a * a - b * b;
-        }
-    }
-
-    /// Exact difference sums for the window ending at the newest sample (only when the lag range
-    /// changes - a parameter change - or right after a reset).
-    fn yin_recompute(&mut self, max_tau: usize) {
-        let t_new = self.dec_w - 1;
-        for tau in 1..=max_tau {
-            let mut acc = 0i64;
-            for j in 0..YIN_W as i64 {
-                let k = t_new - j;
-                let a = self.yq[(k & 4095) as usize] as i64 - self.yq[((k - tau as i64) & 4095) as usize] as i64;
-                acc += a * a;
+        let d = self.w as f64 - self.pos;
+        let l = self.lat_rs as f64;
+        let rr = self.rate_target.max(self.rate);
+        let rl = self.rate_target.min(self.rate);
+        if voiced {
+            let t = p;
+            if d < l - 0.55 * t && rr > 1.0 {
+                let k = ((l - d) / t).round().max(1.0);
+                self.jump(-(k * t), t, true);
+            } else if d > l + 0.55 * t && rl < 1.0 {
+                let k = ((d - l) / t).round().max(1.0);
+                self.jump(k * t, t, true);
             }
-            self.ysum[tau] = acc;
+        } else {
+            // breath / consonants: the ratio is 1, the head only has to come home after a note
+            let lim = 0.6 * self.max_period;
+            if (d - l).abs() > lim {
+                let j = d - l;
+                self.jump(j, self.fallback(), false);
+            }
         }
-        self.ytau = max_tau;
     }
 
-    fn run_yin(&mut self) {
-        // Always look up to at least 1600 Hz (about G6): a voice above the search range is read an
-        // octave low, and the grains then come out an octave low too - the "jumps an octave for no
-        // reason" on high notes, falsetto or a range set too low. The range still decides which
-        // notes are corrected.
+    /// Moves the read head by about `amount` samples (+ forwards, - back), at the offset whose
+    /// waveform best continues the current one, with a cross-fade.
+    fn jump(&mut self, amount: f64, period: f64, voiced: bool) {
+        let win = (period.min(0.012 * self.fs)).max(32.0) as i64;
+        let search = if voiced { (0.15 * period).max(4.0) as i64 } else { (0.5 * period) as i64 };
+        let cand = self.pos + amount;
+        let newest = self.w - 3;
+        let m = self.ring_mask;
+        // the current head's upcoming samples
+        let p0 = self.pos.round() as i64;
+        let mut e0 = 1e-12f64;
+        let mut j = 0;
+        while j < win {
+            let v = rd(&self.mono, m, p0 + j) as f64;
+            e0 += v * v;
+            j += 2;
+        }
+        let mut best = 0i64;
+        let mut best_s = f64::MIN;
+        for dlt in -search..=search {
+            let c0 = cand.round() as i64 + dlt;
+            if c0 + win + 4 >= newest {
+                continue;
+            }
+            let (mut dot, mut e1) = (0.0f64, 1e-12f64);
+            let mut j = 0;
+            while j < win {
+                let a = rd(&self.mono, m, p0 + j) as f64;
+                let b = rd(&self.mono, m, c0 + j) as f64;
+                dot += a * b;
+                e1 += b * b;
+                j += 2;
+            }
+            // a slight preference for the nominal offset
+            let sc = dot / (e0 * e1).sqrt() - 0.05 * (dlt.abs() as f64 / search.max(1) as f64);
+            if sc > best_s {
+                best_s = sc;
+                best = dlt;
+            }
+        }
+        if best_s == f64::MIN {
+            return;
+        }
+        let new_pos = self.pos + amount + best as f64;
+        // cross-fade: about a period (shorter when the next jump would come sooner)
+        let r_dev = (self.rate - 1.0).abs().max(1e-3);
+        let mut len = if voiced { period.clamp(0.004 * self.fs, 0.015 * self.fs).min(0.8 * period / r_dev) } else { 0.012 * self.fs };
+        // neither head may reach the newest input during the fade
+        let room = (self.w as f64 - new_pos.max(self.pos)) - 8.0;
+        if self.rate > 1.0 {
+            len = len.min(room / (self.rate - 1.0));
+        }
+        let len = len.max(16.0) as usize;
+        self.xf_pos = self.pos;
+        self.pos = new_pos;
+        self.xf_len = len;
+        self.xf_left = len;
+        // correlated (a good match) -> equal gain; noise -> equal power
+        self.xf_pow = best_s < 0.6;
+        self.jumps += 1;
+    }
+
+    fn read_cubic(&self, ch: usize, pos: f64) -> f32 {
+        let i = pos.floor() as i64;
+        let f = (pos - i as f64) as f32;
+        let last = self.w - 1;
+        let at = |k: i64| rd(&self.ring[ch], self.ring_mask, k.min(last));
+        let (y0, y1, y2, y3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        let c1 = 0.5 * (y2 - y0);
+        let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+        let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+        ((c3 * f + c2) * f + c1) * f + y1
+    }
+
+    // --------------------------------------------------------------------------------------
+    // Pitch frames: McLeod pitch method (normalised square difference, first strong peak)
+    // --------------------------------------------------------------------------------------
+    fn run_mpm(&mut self) {
         let min_tau = ((self.fs_dec / self.p.max_hz.clamp(1600.0, 2000.0) as f64) as usize).max(2);
-        let max_tau = (((self.fs_dec / self.p.min_hz.max(40.0) as f64) as usize) + 2).min(600);
-        let need = YIN_W + max_tau + 2;
-        if (self.dec_w as usize) < need {
+        let max_tau = ((self.fs_dec / self.p.min_hz.max(40.0) as f64) as usize + 2).min(500);
+        let wlen = mpm_window(self.fs_dec, self.p.min_hz as f64);
+        if (self.dec_w as usize) < wlen {
             return;
         }
-
-        self.yin_buf.clear();
-        for i in 0..need {
-            let k = self.dec_w - need as i64 + i as i64;
-            self.yin_buf.push(self.dec[(k & 4095) as usize]);
+        let mut nfft = 64;
+        while nfft < 2 * wlen {
+            nfft <<= 1;
         }
+        let nfft = nfft.min(2048);
         let mut e = 0.0f64;
-        for i in (need - YIN_W)..need {
-            e += (self.yin_buf[i] as f64) * (self.yin_buf[i] as f64);
+        for i in 0..nfft {
+            let v = if i < wlen { self.dec[((self.dec_w - wlen as i64 + i as i64) & 4095) as usize] as f64 } else { 0.0 };
+            self.pre[i] = v;
+            self.pim[i] = 0.0;
+            e += v * v;
         }
-        let rms_db = 10.0 * (e / YIN_W as f64 + 1e-12).log10();
-
-        self.yin_d.clear();
-        self.yin_d.resize(max_tau + 2, 1.0);
-        if self.ytau != max_tau {
-            self.yin_recompute(max_tau);
+        let rms_db = 10.0 * (e / wlen as f64 + 1e-12).log10();
+        // autocorrelation by FFT
+        self.pfft.forward(&mut self.pre[..nfft], &mut self.pim[..nfft]);
+        for i in 0..nfft {
+            self.pre[i] = self.pre[i] * self.pre[i] + self.pim[i] * self.pim[i];
+            self.pim[i] = 0.0;
         }
-        let mut running = 0.0f64;
-        for tau in 1..=max_tau {
-            let d = self.ysum[tau] as f64 * (1.0 / (YQ_SCALE as f64 * YQ_SCALE as f64));
-            running += d;
-            self.yin_d[tau] = (d * tau as f64 / (running + 1e-12)) as f32;
+        self.pfft.inverse(&mut self.pre[..nfft], &mut self.pim[..nfft]);
+        // m(tau) = sum of x_j^2 + x_{j+tau}^2 over the overlap
+        let x = |i: usize| self.dec[((self.dec_w - wlen as i64 + i as i64) & 4095) as usize] as f64;
+        let top = (wlen - 1).min(self.nsdf.len() - 1);
+        let mut mm = 2.0 * e;
+        self.nsdf[0] = 1.0;
+        for tau in 1..=top {
+            mm -= x(tau - 1).powi(2) + x(wlen - tau).powi(2);
+            self.nsdf[tau] = if mm > 1e-12 { 2.0 * self.pre[tau] / mm } else { 0.0 };
         }
-
-        // candidates = local minima
-        let mut cands: [(usize, f32); 12] = [(0, 0.0); 12];
-        let mut nc = 0;
-        for tau in min_tau..max_tau {
-            let v = self.yin_d[tau];
-            if v < 0.35 && v <= self.yin_d[tau - 1] && v < self.yin_d[tau + 1] && nc < cands.len() {
-                cands[nc] = (tau, v);
-                nc += 1;
+        // key maxima: the highest point between each rise above zero and the next fall below
+        let mut keys: [(usize, f64); 24] = [(0, 0.0); 24];
+        let mut nk = 0;
+        let mut tau = 1;
+        // skip the main lobe around zero lag
+        while tau < top && self.nsdf[tau] > 0.0 {
+            tau += 1;
+        }
+        while tau < top && nk < keys.len() {
+            while tau < top && self.nsdf[tau] <= 0.0 {
+                tau += 1;
+            }
+            let mut bt = tau;
+            while tau < top && self.nsdf[tau] > 0.0 {
+                if self.nsdf[tau] > self.nsdf[bt] {
+                    bt = tau;
+                }
+                tau += 1;
+            }
+            if bt >= min_tau && bt <= max_tau && bt > 0 && bt < top && self.nsdf[bt] > 0.0 {
+                keys[nk] = (bt, self.nsdf[bt]);
+                nk += 1;
             }
         }
-        let cands = &cands[..nc];
-
-        // YIN's "first dip under the threshold", but only a dip that is about as clean as the best
-        // one: a shallow dip at half the period (strong 2nd harmonic) used to win and start the
-        // note an octave high
-        let dmin = cands.iter().map(|c| c.1).fold(1.0f32, f32::min);
-        let mut best: Option<(usize, f32)> = cands.iter().copied().find(|c| c.1 < 0.15 && c.1 < dmin + 0.05);
-        if best.is_none() {
-            best = cands.iter().copied().filter(|c| c.1 < 0.30).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        }
-        // continuity: prefer a candidate within ~12 % of the previous period (kills octave jumps)
-        if self.prev_tau > 0.0 {
-            let prev = self.prev_tau;
-            let near = cands
-                .iter()
-                .copied()
-                .filter(|c| (c.0 as f32 / prev).ln().abs() < 0.12)
-                .min_by(|a, b| {
-                    (a.0 as f32 / prev).ln().abs().partial_cmp(&(b.0 as f32 / prev).ln().abs()).unwrap()
-                });
-            if let Some(n) = near {
-                // YIN also dips at 2x / 3x the true period: after a leap up an octave the old period
-                // is exactly such a multiple. Continuity must not keep us on it while a clear dip at
-                // 1/2 or 1/3 of it is there - that one is the real fundamental.
-                let sub_of_fund = cands.iter().any(|c| {
-                    c.1 < 0.15 && c.1 < n.1 + 0.08 && [2.0f32, 3.0].iter().any(|k| ((n.0 as f32 / c.0 as f32) / k).ln().abs() < 0.05)
-                });
-                if !sub_of_fund && best.map_or(true, |b| n.1 < b.1 + 0.12) {
-                    best = Some(n);
+        let keys = &keys[..nk];
+        let nmax = keys.iter().map(|k| k.1).fold(0.0f64, f64::max);
+        // the first peak that is nearly as clear as the clearest one: never a multiple of the period
+        let thr = 0.86 * nmax;
+        let mut pick = keys.iter().copied().find(|k| k.1 >= thr);
+        // a strong 2nd harmonic (vowels "ee" / "oo", breathy voice) puts a peak at half the period
+        // that can pass the threshold: a real period repeats at least as clearly at twice its lag
+        // as at half of it, so a clearly better peak at twice the pick means the pick was half.
+        for _ in 0..2 {
+            if let Some(pk) = pick {
+                let dbl = keys.iter().copied().filter(|k| ((k.0 as f64) / (2.0 * pk.0 as f64)).ln().abs() < 0.06).max_by(|a, b| a.1.total_cmp(&b.1));
+                // ... and the half-period pick shows itself at 3x: that is 1.5 true periods (a dip)
+                let near_max = |t: f64| -> Option<f64> {
+                    let (a, b) = ((t * 0.96) as usize, (t * 1.04).ceil() as usize);
+                    if b >= top {
+                        return None;
+                    }
+                    Some((a..=b).map(|i| self.nsdf[i]).fold(-1.0, f64::max))
+                };
+                match dbl {
+                    Some(d) if d.1 > pk.1 + 0.04 && near_max(3.0 * pk.0 as f64).map_or(d.1 > pk.1 + 0.2, |v3| d.1 > v3 + 0.12) => pick = Some(d),
+                    _ => break,
                 }
             }
         }
-
-        // octave check on the pick: a clear dip at half the period means the pick was two periods
-        // (the note would start an octave low): take the shorter one. (The opposite case - a
-        // shallow dip at half the true period winning - is handled by the first-dip rule above.)
-        if let Some((tau, v)) = best {
-            let dip_near = |t: f32| -> Option<(usize, f32)> {
-                cands.iter().copied().filter(|c| (c.0 as f32 / t).ln().abs() < 0.06).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            };
-            if let Some(h) = dip_near(tau as f32 * 0.5) {
-                if h.1 < 0.2 && h.1 < v + 0.06 {
-                    best = Some(h);
+        // continuity: a peak right at the period we follow wins when it is about as clear (stops
+        // flicker between neighbouring estimates; never between octaves: that peak must be the
+        // first or later than an already clear one only if it is not a multiple)
+        if let (Some(pk), true) = (pick, self.prev_tau > 0.0) {
+            if let Some(near) = keys.iter().copied().filter(|k| ((k.0 as f64) / self.prev_tau).ln().abs() < 0.08).max_by(|a, b| a.1.total_cmp(&b.1)) {
+                let is_multiple = near.0 > pk.0 && ((near.0 as f64 / pk.0 as f64) - (near.0 as f64 / pk.0 as f64).round()).abs() < 0.08;
+                if !is_multiple && near.1 >= 0.93 * pk.1 {
+                    pick = Some(near);
                 }
             }
         }
-        // a weak dip exactly an octave away from the period we are following is a transition
-        // smear (two notes / a consonant in one window), not a real octave move: skip the frame
-        // instead of jumping (a real leap shows a clean dip within a few ms)
-        if let Some((tau, v)) = best {
-            if self.prev_tau > 0.0 && v > 0.12 {
-                let r = (tau as f32 / self.prev_tau).ln().abs();
-                if (r - std::f32::consts::LN_2).abs() < 0.08 {
-                    best = None;
+        // a sudden drop of half an octave or more while the period we follow is still clearly
+        // there is a glide / a consonant smearing the window, not a real leap: stay (a jump up
+        // to a clear shorter period is always taken - that is how a wrong low reading ends)
+        if let (Some(pk), true) = (pick, self.prev_tau > 0.0) {
+            let ratio = pk.0 as f64 / self.prev_tau;
+            if ratio > 1.45 {
+                if let Some(near) = keys.iter().copied().filter(|k| ((k.0 as f64) / self.prev_tau).ln().abs() < 0.12).max_by(|a, b| a.1.total_cmp(&b.1)) {
+                    if near.1 >= pk.1 - 0.02 {
+                        pick = Some(near);
+                    }
                 }
             }
         }
         let gate_open = rms_db > self.p.gate_db as f64;
-        let mut frame = Frame { time: self.w, period: self.last_period as f32, voiced: false };
-        if let (Some((tau, _)), true) = (best, gate_open) {
-            let (a, b, c) = (self.yin_d[tau - 1] as f64, self.yin_d[tau] as f64, self.yin_d[tau + 1] as f64);
-            let den = a - 2.0 * b + c;
-            let shift = if den.abs() > 1e-9 { (0.5 * (a - c) / den).clamp(-1.0, 1.0) } else { 0.0 };
-            let tau_f = tau as f64 + shift;
-            frame.period = (tau_f * self.decim as f64) as f32;
-            frame.voiced = true;
-            self.prev_tau = tau_f as f32;
-            self.unvoiced_run = 0;
-        } else {
-            self.unvoiced_run += 1;
-            if self.unvoiced_run > 4 {
-                self.prev_tau = 0.0;
+        let wl_in = (wlen * self.decim) as i64;
+        let mut frame = Frame { time: self.w - wl_in / 2, period: self.last_period as f32, voiced: false };
+        // two notes in one window (a leap, a slide, a consonant between notes) repeat together
+        // only at a long common period: a sudden, not quite clean reading well below the note we
+        // follow is held off for a few frames (a real low note is clean and stays)
+        if let (Some(pk), true, true) = (pick, self.prev_tau > 0.0, gate_open) {
+            if pk.0 as f64 > 1.45 * self.prev_tau && pk.1 < 0.93 && self.hold_run < 4 {
+                self.hold_run += 1;
+                let frame = Frame { time: self.w - (wlen * self.decim) as i64 / 2, period: (self.prev_tau * self.decim as f64) as f32, voiced: true };
+                self.frames[(self.nframes % FRAME_RING as u64) as usize] = frame;
+                self.nframes += 1;
+                return;
+            }
+        }
+        self.hold_run = 0;
+        match pick {
+            Some((t, v)) if v > 0.45 && gate_open => {
+                let (a, b, c) = (self.nsdf[t - 1], self.nsdf[t], self.nsdf[t + 1]);
+                let den = a - 2.0 * b + c;
+                let sh = if den.abs() > 1e-12 { (0.5 * (a - c) / den).clamp(-1.0, 1.0) } else { 0.0 };
+                let tf = t as f64 + sh;
+                frame.period = (tf * self.decim as f64) as f32;
+                frame.voiced = true;
+                self.prev_tau = tf;
+                self.unvoiced_run = 0;
+                self.last_period += 0.3 * (frame.period as f64 - self.last_period);
+            }
+            _ => {
+                self.unvoiced_run += 1;
+                if self.unvoiced_run > 4 {
+                    self.prev_tau = 0.0;
+                }
             }
         }
         self.frames[(self.nframes % FRAME_RING as u64) as usize] = frame;
         self.nframes += 1;
     }
 
-    /// Pitch of the audio around input time `t` (centred median of nearby frames).
+    /// Pitch of the audio around input time `t` (median of the frames centred near it).
     fn query(&self, t: f64) -> (bool, f64) {
         if self.nframes == 0 {
             return (false, self.fallback());
         }
-        let hop = (YIN_HOP * self.decim) as f64;
-        let target = t + 0.5 * (YIN_W * self.decim) as f64 + 0.5 * self.last_period;
+        let hop = (HOP * self.decim) as f64;
         let mut periods = [0.0f32; 8];
         let (mut n, mut nv) = (0usize, 0usize);
-
         let newest = self.frames[((self.nframes - 1) % FRAME_RING as u64) as usize];
-        let target = target.min(newest.time as f64);
-
+        let target = t.min(newest.time as f64);
         let mut i = self.nframes;
         let mut scanned = 0;
-        while i > 0 && scanned < 64 && n < 8 {
+        while i > 0 && scanned < 64 && n < 5 {
             i -= 1;
             scanned += 1;
             let f = self.frames[(i % FRAME_RING as u64) as usize];
@@ -906,129 +1062,6 @@ impl Engine {
         let s = &mut periods[..nv];
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         (true, s[nv / 2] as f64)
-    }
-
-    // --------------------------------------------------------------------------------------
-    // Pitch marks (waveform-aligned, one per period)
-    // --------------------------------------------------------------------------------------
-    fn newest_mark(&self) -> i64 {
-        self.marks[((self.nmarks - 1) % MARK_RING as u64) as usize]
-    }
-    fn push_mark(&mut self, m: i64) {
-        self.marks[(self.nmarks % MARK_RING as u64) as usize] = m;
-        self.nmarks += 1;
-    }
-
-    fn advance_marks(&mut self) {
-        let max_p = self.fs / 40.0;
-        if self.nmarks == 0 {
-            self.push_mark(self.w - self.latency - 2 * self.fallback() as i64);
-        }
-        let mut guard = 0;
-        loop {
-            guard += 1;
-            if guard > 64 {
-                break;
-            }
-            let last = self.newest_mark();
-            if (self.w - last) as f64 > 6.0 * max_p {
-                self.push_mark(self.w - self.latency - self.fallback() as i64);
-                continue;
-            }
-            let (voiced, pq) = self.query(last as f64);
-            let p = if voiced { pq } else { self.fallback() };
-            if voiced {
-                self.last_period += 0.2 * (p - self.last_period);
-            }
-            let cand = (last as f64 + p).round() as i64;
-            let r = if voiced { ((0.2 * p) as i64).max(2) } else { 0 };
-            let half = (p * 0.5) as i64;
-            if cand + r + half + 2 >= self.w {
-                break;
-            }
-            let mut best = cand;
-            if voiced {
-                best = self.refine_mark(last, cand, r, p as usize);
-            }
-            if best <= last + (0.5 * p) as i64 {
-                best = cand;
-            }
-            self.push_mark(best);
-        }
-    }
-
-    /// Choose the offset around `cand` whose waveform segment best matches the segment at `last`.
-    fn refine_mark(&self, last: i64, cand: i64, r: i64, len: usize) -> i64 {
-        let len = len.max(16) as i64;
-        let h = len / 2;
-        let m = self.ring_mask;
-        let mut e_ref = 1e-12f64;
-        let mut j = 0;
-        while j < len {
-            let v = rd(&self.mono, m, last - h + j) as f64;
-            e_ref += v * v;
-            j += 2;
-        }
-        let mut best = cand;
-        let mut best_score = f64::MIN;
-        for d in -r..=r {
-            let (mut dot, mut e) = (0.0f64, 1e-12f64);
-            let mut j = 0;
-            while j < len {
-                let a = rd(&self.mono, m, last - h + j) as f64;
-                let b = rd(&self.mono, m, cand + d - h + j) as f64;
-                dot += a * b;
-                e += b * b;
-                j += 2;
-            }
-            let score = dot / (e_ref * e).sqrt() - 0.0004 * (d.abs() as f64) / (r as f64);
-            if score > best_score {
-                best_score = score;
-                best = cand + d;
-            }
-        }
-        best
-    }
-
-    /// The pitch mark right after `m`, if it is already known.
-    fn mark_after(&self, m: i64) -> Option<i64> {
-        let n = self.nmarks;
-        let oldest = n.saturating_sub(MARK_RING as u64 - 2);
-        let mut i = n;
-        let mut after = None;
-        while i > oldest {
-            i -= 1;
-            let k = self.marks[(i % MARK_RING as u64) as usize];
-            if k > m {
-                after = Some(k);
-            } else {
-                break;
-            }
-        }
-        after
-    }
-
-    fn pick_mark(&self, nom: f64) -> i64 {
-        let n = self.nmarks;
-        if n == 0 {
-            return nom.round() as i64;
-        }
-        let oldest = n.saturating_sub(MARK_RING as u64 - 2);
-        let mut i = n;
-        while i > oldest {
-            i -= 1;
-            let m = self.marks[(i % MARK_RING as u64) as usize];
-            if (m as f64) <= nom {
-                if i + 1 < n {
-                    let up = self.marks[((i + 1) % MARK_RING as u64) as usize];
-                    if (up as f64 - nom).abs() < (nom - m as f64).abs() {
-                        return up;
-                    }
-                }
-                return m;
-            }
-        }
-        self.marks[(oldest % MARK_RING as u64) as usize]
     }
 
     // --------------------------------------------------------------------------------------
@@ -1408,218 +1441,11 @@ impl Engine {
         self.meters.centre = self.centre as f32;
         2f64.powf(total / 12.0)
     }
-
-    // --------------------------------------------------------------------------------------
-    // Grain synthesis
-    // --------------------------------------------------------------------------------------
-    fn read_cubic(&self, ch: usize, pos: f64) -> f32 {
-        let i = pos.floor() as i64;
-        let f = (pos - i as f64) as f32;
-        let last = self.w - 1;
-        let at = |k: i64| rd(&self.ring[ch], self.ring_mask, k.min(last));
-        let (y0, y1, y2, y3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
-        let c1 = 0.5 * (y2 - y0);
-        let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
-        let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
-        ((c3 * f + c2) * f + c1) * f + y1
-    }
-
-    /// Interval (in semitones) from `base` to the allowed note nearest to base + iv.
-    fn snap_interval(&self, base: i32, iv: f32) -> f64 {
-        let k = iv.round() as i32;
-        let sg = if iv < 0.0 { -1 } else { 1 };
-        for d in [0, -sg, sg, -2 * sg, 2 * sg] {
-            if self.is_allowed(base + k + d) {
-                return (k + d) as f64;
-            }
-        }
-        iv as f64
-    }
-
-    /// Classic time-domain grain: read the source at rate `s` (moves formants with the resampling).
-    #[allow(clippy::too_many_arguments)]
-    fn add_classic(&mut self, nch: usize, m: i64, f: f64, hg: i64, kmin: i64, oi: i64, scale: f64, s: f64, gain: [f32; MAX_CH], dly: i64) {
-        let dth = PI / hg as f64;
-        let (sd, cd) = dth.sin_cos();
-        let (mut sn, mut cs) = (PI * (kmin as f64 - f) / hg as f64).sin_cos();
-        for k in kmin..hg {
-            let u = k as f64 - f;
-            let wv = (scale * 0.5 * (1.0 + cs)) as f32;
-            (cs, sn) = (cs * cd - sn * sd, sn * cd + cs * sd);
-            let sp = m as f64 + u * s;
-            let idx = ((oi + k + dly) & self.ring_mask) as usize;
-            for ch in 0..nch {
-                let v = self.read_cubic(ch, sp);
-                self.ola[ch][idx] += wv * v * gain[ch];
-            }
-        }
-    }
-
-    fn place_grain(&mut self, vi: usize, o: i64, nch: usize) {
-        let mut sy = self.syn[vi];
-        // choose the analysis centre: the nearest pitch mark, unless marks are too sparse here
-        // (e.g. just after an unvoiced stretch) - then use the wanted position itself.
-        let (_, p0) = self.query(sy.content_nom);
-        let mut m = self.pick_mark(sy.content_nom);
-        if (m as f64 - sy.content_nom).abs() > 0.6 * p0 {
-            m = sy.content_nom.round() as i64;
-        }
-        let (voiced, pq) = self.query(m as f64);
-        let p = if voiced { pq } else { self.fallback() };
-        let dt = sy.prev_hs / self.fs;
-
-        let mut gain = [1.0f32; MAX_CH];
-        let mut dly = 0i64;
-        let mut vformant = 0.0f32;
-        let r;
-        if vi == 0 {
-            r = self.compute_ratio(dt, voiced, p);
-            self.cur_r = r;
-            for v in 0..NUM_VOICES {
-                let vp = self.p.voices[v];
-                let target = if vp.snap && self.have_note && voiced { self.snap_interval(self.cur_note, vp.interval) } else { vp.interval as f64 };
-                let tau = (self.p.transition_ms as f64 / 1000.0).max(0.01);
-                self.vdelta[v] += (target - self.vdelta[v]) * (1.0 - (-dt / tau).exp());
-            }
-        } else {
-            let vp = self.p.voices[vi - 1];
-            r = if voiced { self.cur_r * 2f64.powf((self.vdelta[vi - 1] + vp.detune_cents as f64 / 100.0) / 12.0) } else { 1.0 };
-            let lv = 10f32.powf(vp.level_db / 20.0);
-            if nch == 2 {
-                let a = (vp.pan.clamp(-1.0, 1.0) + 1.0) * 0.25 * std::f32::consts::PI;
-                gain = [lv * a.cos() * std::f32::consts::SQRT_2, lv * a.sin() * std::f32::consts::SQRT_2];
-            } else {
-                gain = [lv, lv];
-            }
-            dly = (vp.delay_ms as f64 * self.fs / 1000.0) as i64;
-            vformant = vp.formant_semis;
-        }
-
-        // Output hop = the real distance to the next pitch mark (not the detector's period
-        // estimate) divided by the ratio: with no shift the grains then land exactly where they
-        // came from and the voice is rebuilt unchanged. With the estimate, grains drifted against
-        // the original, overlapped out of phase and periods were dropped / repeated even at
-        // ratio 1 - a rough, not-quite-live sound.
-        let d = if voiced {
-            self.mark_after(m).map(|n| (n - m) as f64).filter(|d| *d > 0.6 * p && *d < 1.6 * p).unwrap_or(p)
-        } else {
-            p
-        };
-        let hs = d / r;
-        // grain half-length: one input period, stretched at most to 1.35 p. Stretching it all the
-        // way to the output hop put several input periods into every grain on big downward
-        // shifts and rebuilt the original pitch (Transpose -12 came out unchanged).
-        let hg = ((p.max(hs.min(1.35 * p))).ceil() as i64).max(8);
-        let follow = if self.p.formant_preserve { 0.0 } else { self.p.formant_follow as f64 };
-        let s_raw = if self.p.formant_on { 2f64.powf((self.p.formant_semis + vformant) as f64 / 12.0) * r.powf(follow) } else { 1.0 };
-        let mode = self.p.formant_mode;
-        let fits = (2 * hg) as usize <= self.gbuf[0].len();
-        // Formant-preserving pitch shift (Classic mode, Formant Correction on). Plain PSOLA reads
-        // every grain at rate 1 and only moves the grains: the harmonics line up, but everything
-        // between them (breath, air, the noisy part of the voice) adds up out of phase between
-        // overlapping grains and loses ~1.5-2.5 dB above 3 kHz whenever the pitch is moved.
-        // Instead the grain is resampled by the pitch ratio - then neighbouring grains read
-        // exactly the same input samples and add up coherently, like with no shift at all - and
-        // the formants that the resampling moved are put back with the spectral envelope.
-        let hybrid = mode == FormantMode::Classic
-            && self.p.formant_on
-            && self.p.formant_preserve
-            && voiced
-            && r.ln().abs() > 0.002
-            && (r - 1.0).abs() < 1.0
-            && fits
-            && m as f64 + (hg as f64 + 3.0) * r <= (self.w - 1) as f64;
-        let spectral = hybrid || (mode != FormantMode::Classic && s_raw.ln().abs() > 0.002 && fits);
-        let (read_rate, env_s, env_mode) = if hybrid { (r, s_raw / r, FormantMode::Smooth) } else { (1.0, s_raw, mode) };
-        let s_cl = if mode == FormantMode::Classic { s_raw.clamp(0.5, 2.0) } else { 1.0 };
-
-        let mut tc = sy.next_centre;
-        // A grain whose left half would start in the past used to be cut off there - the window
-        // then jumped from 0 to ~0.6 in one sample: a click / short squeak. It happened when the
-        // period suddenly grew (a low note starting after a breath or consonant) and only for
-        // some start positions, so a render had it "every other time". Start it a little later
-        // instead; the content pull below takes the few ms back.
-        if tc < (o + hg) as f64 {
-            tc = (o + hg) as f64;
-        }
-        if vi == 0 {
-            self.dbg_lag = (tc - m as f64) - self.latency as f64;
-        }
-        let oi = tc.floor() as i64;
-        let f = tc - oi as f64;
-        let scale = hs / hg as f64;
-
-        let mut kmin = -hg;
-        let clipped = oi + kmin < o;
-        if clipped {
-            kmin = o - oi;
-        }
-        if self.debug && vi == 0 {
-            eprintln!("o={:.4}s tc={:.0} m={} voiced={} p={:.0} r={:.3} hs={:.0} hg={} lag={:.0} clipped={} (lost {} samp)", o as f64 / self.fs, tc, m, voiced, p, r, hs, hg, self.dbg_lag, clipped, if clipped { o - (oi - hg) } else { 0 });
-        }
-
-        if vi > 0 && !voiced {
-            // extra voices stay silent on consonants and breaths
-        } else if !spectral {
-            self.add_classic(nch, m, f, hg, kmin, oi, scale, s_cl, gain, dly);
-        } else {
-            let l = (2 * hg) as usize;
-            let s = env_s.clamp(0.4, 2.5);
-            let tilt = if hybrid { 0.0 } else { self.p.formant_tilt as f64 };
-            // Hann window by rotation (one cos/sin per grain instead of one cos per sample and channel)
-            let dth = PI / hg as f64;
-            let (sd, cd) = dth.sin_cos();
-            let (mut sn, mut cs) = (PI * (-hg as f64 - f) / hg as f64).sin_cos();
-            for j in 0..l {
-                let u = (j as i64 - hg) as f64 - f;
-                let wv = (scale * 0.5 * (1.0 + cs)) as f32;
-                for ch in 0..nch {
-                    self.gbuf[ch][j] = wv * self.read_cubic(ch, m as f64 + u * read_rate);
-                }
-                (cs, sn) = (cs * cd - sn * sd, sn * cd + cs * sd);
-            }
-            let ok = {
-                let (g0, g1) = self.gbuf.split_at_mut(1);
-                let right = if nch == 2 { Some(&mut g1[0][..l]) } else { None };
-                // a resampled grain has the pitch period of the output
-                self.shifter.process2(&mut g0[0][..l], right, p / read_rate, self.fs, env_mode, s, tilt)
-            };
-            if ok {
-                for k in kmin..hg {
-                    let idx = ((oi + k + dly) & self.ring_mask) as usize;
-                    for ch in 0..nch {
-                        self.ola[ch][idx] += self.gbuf[ch][(k + hg) as usize] * gain[ch];
-                    }
-                }
-            } else {
-                let s_fb = if hybrid { s_cl } else { s.clamp(0.5, 2.0) };
-                self.add_classic(nch, m, f, hg, kmin, oi, scale, s_fb, gain, dly);
-            }
-        }
-
-        sy.next_centre = tc + hs;
-        // continue from the chosen mark; slowly pull back towards the nominal latency
-        // Normally continue from the chosen mark. When the grains are much denser than the
-        // pitch marks (strong upward shift, hs < p), the nearest mark would be picked again and
-        // again and the content would fall behind real time - so then advance the nominal
-        // position by exactly one hop and let the mark picker repeat marks as needed.
-        let nom = if hs < 0.75 * d { sy.content_nom + hs } else { m as f64 + hs };
-        let lag_err = (sy.next_centre - self.latency as f64) - nom;
-        sy.content_nom = nom + (self.pull * lag_err).clamp(-0.5 * hs, 0.5 * hs);
-        sy.prev_hs = hs;
-        // decide early enough for the next grain too: its half-length follows the period at the next
-        // content position (already analysed - it lies a latency behind the input)
-        let (vn, pn) = self.query(sy.content_nom);
-        let pn = if vn { pn } else { self.fallback() };
-        sy.next_decision = sy.next_centre - ((1.3 * p.max(hs).max(self.fallback())).max(1.35 * pn) + 4.0);
-        if sy.next_decision < o as f64 - hs {
-            sy.next_centre = o as f64 + hs;
-            sy.next_decision = o as f64;
-            sy.content_nom = sy.next_centre - self.latency as f64;
-        }
-        self.syn[vi] = sy;
-    }
 }
+
+#[cfg(test)]
+#[path = "analysis.rs"]
+mod analysis;
 
 #[cfg(test)]
 mod fuzz_tests {
@@ -1778,86 +1604,6 @@ mod fuzz_tests {
         out
     }
 
-    /// A voice far above the lead (hs << pitch period) must stay locked to real time and clean,
-    /// and the sum of loud voices must not clip.
-    #[test]
-    fn high_voice_stays_in_time_and_sum_does_not_clip() {
-        let fs = 48000.0f64;
-        let n = (fs * 3.0) as usize;
-        let f0 = 220.0f64;
-        // simple vowel-like pulse train, 2 resonances
-        let (mut y1, mut y2, mut z1, mut z2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        let x: Vec<f32> = (0..n)
-            .map(|i| {
-                let ph = (i as f64 * f0 / fs) % 1.0;
-                let src = if ph < 0.05 { 1.0 } else { -0.05 };
-                let r = 0.985;
-                let th = 2.0 * PI * 700.0 / fs;
-                let y = src * 0.1 + 2.0 * r * th.cos() * y1 - r * r * y2;
-                y2 = y1;
-                y1 = y;
-                let th2 = 2.0 * PI * 1500.0 / fs;
-                let z = y * 0.1 + 2.0 * r * th2.cos() * z1 - r * r * z2;
-                z2 = z1;
-                z1 = z;
-                (z * 3.0) as f32
-            })
-            .collect();
-        let peak_in = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        let x: Vec<f32> = x.iter().map(|v| v * 0.5 / peak_in).collect();
-        let run = |iv: f32, lvl: f32, n_on: usize| -> Vec<f32> {
-            let mut e = Engine::new(fs, 70.0);
-            let mut p = Params::default();
-            p.scale = 0; // chromatic
-            p.retune_ms = 50.0;
-            for k in 0..n_on {
-                p.voices[k] = VoiceParams { on: true, interval: iv, level_db: lvl, ..VoiceParams::default() };
-            }
-            let mut out = Vec::with_capacity(n);
-            for ch in x.chunks(128) {
-                e.set_params(&p);
-                for &s in ch {
-                    out.push(e.process_frame([s, s], 1)[0]);
-                }
-            }
-            out
-        };
-        // voice-only signal = with voice minus without
-        let base = run(0.0, -9.0, 0);
-        let hi = run(24.0, 0.0, 1);
-        let v: Vec<f32> = hi.iter().zip(&base).skip(fs as usize).map(|(a, b)| a - b).collect();
-        let fv = f0 * 4.0;
-        let (mut harm, mut tot) = (0.0f64, 0.0f64);
-        for k in 1..=18 {
-            // Goertzel-ish single-bin DFT energy around k*fv and in between
-            for (fr, is_h) in [(k as f64 * fv, true), (k as f64 * fv + fv / 2.0, false)] {
-                if fr > 8000.0 {
-                    continue;
-                }
-                let (mut re, mut im) = (0.0f64, 0.0f64);
-                for (i, s) in v.iter().enumerate() {
-                    let w = 0.5 - 0.5 * (2.0 * PI * i as f64 / v.len() as f64).cos();
-                    let a = 2.0 * PI * fr * i as f64 / fs;
-                    re += *s as f64 * w * a.cos();
-                    im += *s as f64 * w * a.sin();
-                }
-                let e = re * re + im * im;
-                tot += e;
-                if is_h {
-                    harm += e;
-                }
-            }
-        }
-        assert!(harm / tot > 0.9, "+24 st voice is not harmonic: {:.2}", harm / tot);
-        // two loud voices: no hard clipping
-        let loud = run(12.0, 6.0, 2);
-        let pk = loud.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        assert!(pk < 1.0, "peak {pk}");
-    }
-
-
-    /// Quality check on a vowel-like voice 40 cents sharp: the output must sit on the note (within 3 cents),
-    /// keep its level (+-1.5 dB) and stay harmonic (little non-harmonic energy = no grit / warble).
     #[test]
     fn corrected_voice_is_in_tune_loud_enough_and_clean() {
         let fs = 48000.0f64;
@@ -2419,7 +2165,7 @@ mod fuzz_tests {
                 let line = format!("seed {seed0} scale {scale} key {key} tolerance {tol_ms} ms vibrato {keep} speed {retune}: settle {:.0} ms, outside span {:?}, stairs {:?}, unsettled {:?}, output off {:?}",
                     worst_settle * 1000.0, bad_span, stairs, unsettled, off_out);
                 println!("{line}");
-                let limit = 0.09 + tol_ms as f64 / 1000.0 + if keep { 0.03 } else { 0.0 };
+                let limit = 0.09 + tol_ms as f64 / 1000.0 + retune as f64 / 1000.0 + if keep { 0.03 } else { 0.0 };
                 if !bad_span.is_empty() || !stairs.is_empty() || !unsettled.is_empty() || !off_out.is_empty() || worst_settle > limit {
                     report.push(line);
                 }
@@ -2609,3 +2355,4 @@ mod fuzz_tests {
         assert!(tog < 3.0 * base + 0.05, "toggle jump {tog} vs plain {base}");
     }
 }
+

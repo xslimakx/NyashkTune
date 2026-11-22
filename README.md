@@ -43,18 +43,17 @@ The note is always chosen on the note centre (vibrato taken out, from the last v
 ### How it works
 
 ```
-input → high-pass → decimate → YIN (with continuity) → pitch frames (every ~4 ms)
-      → pitch-mark tracker (one mark per period, aligned by waveform correlation)
-      → PSOLA grain synthesiser: for every output grain
-          1. pick the analysis mark that continues the previous one,
-          2. look up the pitch at that moment of the audio (centred median of frames),
-          3. note centre (vibrato removed) → target note by the note states and Tolerance,
-             correction with Speed / Note Transition, vibrato kept or flattened,
-          4. overlap-add a Hann grain; the hop is the real distance to the next pitch mark
-             divided by the ratio, so with no correction the voice is rebuilt unchanged
+input → high-pass → decimate → McLeod pitch method (NSDF, first clear peak) → pitch frames (every ~4 ms)
+      → note logic: note centre (vibrato removed) → target note by the note states and Tolerance,
+        correction with Speed / Note Transition, vibrato kept or flattened → pitch ratio
+      → pitch-synchronous resampler (the classic real-time tuner method): a read head runs
+        through the delayed voice at the ratio; when it drifts too far it jumps by whole
+        periods, at the offset where the waveform matches best, with a cross-fade - whole
+        cycles are repeated or skipped and the waveform stays intact
+      → formant stage: short frames of the result, the spectral envelope moved back
 ```
 
-The latency (≈ 27–37 ms, reported to the host) comes from the pitch detector and depends on the lowest note of the range.
+Because a jump is always a whole number of periods, a pitch reading an octave off cannot break the sound (no sub-octave rumble). The latency (≈ 40–50 ms, reported to the host) depends on the lowest note of the range.
 
 ---
 
