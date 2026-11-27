@@ -2059,7 +2059,44 @@ mod fuzz_tests {
     /// nearest note of the scale, at every Tracking setting: Tracking may delay a switch, never
     /// keep the voice on the previous note for the whole held note.
     #[test]
-    fn held_notes_land_on_the_nearest_note() {
+    fn midi_target_follows_the_held_keys() {
+        // MIDI Target: the voice goes to the notes held on a MIDI keyboard (any octave)
+        let fs = 48000.0;
+        let x = sung(fs, |t| 60.3 + 0.1 * (2.0 * PI * 5.5 * t).sin(), 3.0);
+        let mut e = Engine::new(fs, 70.0);
+        let mut p = Params::default();
+        p.midi_mode = true;
+        let mut got = Vec::new();
+        for (i, ch) in x.chunks(128).enumerate() {
+            let t = i as f64 * 128.0 / fs;
+            // 0..1 s: D held; 1..2 s: A held (two octaves down); 2..3 s: E and G held
+            e.held = [false; 128];
+            if t < 1.0 {
+                e.held[62] = true;
+            } else if t < 2.0 {
+                e.held[45] = true;
+            } else {
+                e.held[64] = true;
+                e.held[55] = true;
+            }
+            e.set_params(&p);
+            for &s in ch {
+                e.process_frame([s, s], 1);
+            }
+            for (k, from) in [(0usize, 0.6), (1, 1.6), (2, 2.6)] {
+                if (t - from).abs() < 1e-9 || (t > from && t - from < 128.0 / fs) {
+                    got.push((k, e.meters.target as i32));
+                }
+            }
+        }
+        got.dedup();
+        println!("midi targets {got:?}");
+        // D -> 62; A (held as 45) -> the nearest A, 57; E / G -> E4 (3.7 st away) beats G3 (5.3)
+        assert_eq!(got.iter().map(|g| g.1).collect::<Vec<_>>(), vec![62, 57, 64], "MIDI Target ignored the held keys: {got:?}");
+    }
+
+    #[test]
+        fn held_notes_land_on_the_nearest_note() {
         let fs = 48000.0;
         // (sung pitch, expected note), 0.6 s each, light 12 cent vibrato
         let seq: [(f64, i32); 7] = [(57.0, 57), (57.65, 58), (60.3, 60), (59.3, 59), (61.35, 61), (60.62, 61), (59.4, 59)];
